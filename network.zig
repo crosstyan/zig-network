@@ -5,7 +5,6 @@ const posix = std.posix;
 
 comptime {
     std.debug.assert(@sizeOf(std.posix.sockaddr) >= @sizeOf(std.posix.sockaddr.in));
-    // std.debug.assert(@sizeOf(std.posix.sockaddr) >= @sizeOf(std.posix.sockaddr.in6));
 }
 
 const is_windows = builtin.os.tag == .windows;
@@ -80,12 +79,16 @@ pub const Address = union(AddressFamily) {
         pub fn format(value: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
             _ = fmt;
             _ = options;
-            try writer.print("{}.{}.{}.{}", .{
+            // https://zig.guide/standard-library/readers-and-writers
+            const sz: comptime_int = 3 * 4 + 3;
+            var buf: [sz]u8 = undefined;
+            const s = try std.fmt.bufPrint(buf[0..], "{}.{}.{}.{}", .{
                 value.value[0],
                 value.value[1],
                 value.value[2],
                 value.value[3],
             });
+            try writer.writeAll(s);
         }
 
         pub fn parse(string: []const u8) !IPv4 {
@@ -205,7 +208,7 @@ pub const Address = union(AddressFamily) {
             // Address cannot start or end with a single ':'.
             if ((string[0] == ':' and string[1] != ':') or
                 (string[string.len - 2] != ':' and
-                string[string.len - 1] == ':'))
+                    string[string.len - 1] == ':'))
             {
                 return error.InvalidFormat;
             }
@@ -243,7 +246,7 @@ pub const Address = union(AddressFamily) {
                         // leading/trailing abbreviation.
                         if (groups[cg_index].len == 0 and
                             (!abbreviation_ending or
-                            (i != 1 and i != string.len - 1)))
+                                (i != 1 and i != string.len - 1)))
                         {
                             return error.InvalidFormat;
                         }
@@ -402,10 +405,13 @@ pub const EndPoint = struct {
     pub fn format(value: Self, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         _ = fmt;
         _ = options;
-        try writer.print("{}:{}", .{
+        const sz: comptime_int = 39 + 5 + 1;
+        var buf: [sz]u8 = undefined;
+        const s = try std.fmt.bufPrint(buf[0..], "{}:{}", .{
             value.address,
             value.port,
         });
+        try writer.writeAll(s);
     }
 
     pub fn fromSocketAddress(src: *const std.posix.sockaddr, size: usize) !Self {
@@ -1584,3 +1590,660 @@ const windows = struct {
             };
     }
 };
+
+// ************* recvmsg *************
+
+const in_addr = extern struct {
+    s_addr: u32,
+};
+
+const in_pktinfo = extern struct {
+    ipi_ifindex: u32,
+    ipi_spec_dst: in_addr,
+    ipi_addr: in_addr,
+};
+
+// IPv6 packet info structure
+const in6_addr = extern struct {
+    s6_addr: [16]u8,
+};
+
+const in6_pktinfo = extern struct {
+    ipi6_addr: in6_addr,
+    ipi6_ifindex: u32,
+};
+
+// https://github.com/pixsper/socket-pktinfo
+// https://github.com/pixsper/socket-pktinfo/blob/main/src/unix.rs
+// https://github.com/pixsper/socket-pktinfo/blob/main/src/win.rs
+
+// https://man7.org/linux/man-pages/man7/ip.7.html
+// https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/musl/include/netinet/in.h#L301-L305
+
+// https://github.com/search?q=repo%3Arust-lang%2Flibc%20cmsghdr&type=code
+// https://github.com/search?q=repo%3Aziglang%2Fzig%20cmsghdr&type=code
+
+// https://stackoverflow.com/questions/4412749/are-flexible-array-members-valid-in-c
+// https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/generic-glibc/bits/socket.h#L265-L295
+// Structure describing messages sent by `sendmsg' and received by `recvmsg'
+
+// https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/generic-glibc/scsi/sg.h#L33-L41
+// https://ziglang.org/documentation/master/std/#std.posix.iovec
+
+// `recvmsg`
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/recvmsg.2.html
+// https://man.freebsd.org/cgi/man.cgi?recvmsg(2)
+// https://man7.org/linux/man-pages/man3/cmsg.3.html
+
+// CMSG definitions
+// musl
+// https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/musl/include/sys/socket.h#L352-L364
+// https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/musl/src/network/recvmsg.c#L20
+// generic libc
+// https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/generic-glibc/bits/socket.h#L282-L317
+// rust
+// https://github.com/rust-lang/libc/blob/main/libc-test/test/cmsg.rs
+// macOS
+// https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/any-macos-any/sys/socket.h#L600-L611
+
+const iovec = std.posix.iovec;
+const msghdr = std.posix.msghdr;
+
+const unix = struct {
+    // there's no `recvmsg` in `bsd` predefined in `std.posix`
+    // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/any-macos-any/sys/socket.h#L600-L611
+    // I bet the `recvmsg` implementation in `bsd` is the same as `linux`
+    // note that std.c is for `solaris` and `illumos`
+
+    fn CMSG_HDR_TYPE() type {
+        return if (is_bsd) {
+            return extern struct {
+                len: std.posix.socklen_t,
+                level: c_int,
+                type: c_int,
+            };
+        } else {
+            // musl implementation
+            // TODO: check if glibc implementation is the same
+            return if (@sizeOf(usize) > 4)
+                if (builtin.target.cpu.arch.endian() == .big)
+                    extern struct {
+                        __pad1: c_int,
+                        len: std.posix.socklen_t,
+                        level: c_int,
+                        type: c_int,
+                    }
+                else
+                    extern struct {
+                        len: std.posix.socklen_t,
+                        __pad1: c_int,
+                        level: c_int,
+                        type: c_int,
+                    }
+            else
+                extern struct {
+                    len: std.posix.socklen_t,
+                    level: c_int,
+                    type: c_int,
+                };
+        };
+    }
+
+    const cmsghdr = CMSG_HDR_TYPE();
+    const recvmsg = std.posix.linux.recvmsg;
+
+    // CMSG macros implementation in Zig
+    // Based on musl implementation which is more robust
+    fn CMSG_ALIGN(len: usize) usize {
+        return (len + @sizeOf(usize) - 1) & ~(@as(usize, @sizeOf(usize) - 1));
+    }
+
+    fn CMSG_LEN(len: usize) usize {
+        return CMSG_ALIGN(@sizeOf(cmsghdr)) + len;
+    }
+
+    fn CMSG_SPACE(len: usize) usize {
+        return CMSG_ALIGN(len) + CMSG_ALIGN(@sizeOf(cmsghdr));
+    }
+
+    fn CMSG_DATA(cmsg: *const cmsghdr) [*]u8 {
+        const ptr: [*]const u8 = @ptrCast(cmsg);
+        return @ptrCast(@constCast(ptr + @sizeOf(cmsghdr)));
+    }
+
+    fn __CMSG_LEN(cmsg: *const cmsghdr) usize {
+        return (cmsg.len + @sizeOf(usize) - 1) & ~(@as(usize, @sizeOf(usize) - 1));
+    }
+
+    fn __CMSG_NEXT(cmsg: *const cmsghdr) [*]u8 {
+        const ptr: [*]const u8 = @ptrCast(cmsg);
+        return @ptrCast(@constCast(ptr + __CMSG_LEN(cmsg)));
+    }
+
+    fn __MHDR_END(mhdr: *const msghdr) [*]u8 {
+        const ptr: [*]const u8 = @ptrCast(mhdr.control);
+        return @ptrCast(@constCast(ptr + mhdr.controllen));
+    }
+
+    fn CMSG_FIRSTHDR(mhdr: *const msghdr) ?*cmsghdr {
+        if (mhdr.controllen >= @sizeOf(cmsghdr)) {
+            return @ptrCast(@alignCast(mhdr.control));
+        }
+        return null;
+    }
+
+    fn CMSG_NXTHDR(mhdr: *const msghdr, cmsg: *const cmsghdr) ?*cmsghdr {
+        if (cmsg.len < @sizeOf(cmsghdr)) {
+            return null;
+        }
+
+        const next = __CMSG_NEXT(cmsg);
+        const end = __MHDR_END(mhdr);
+
+        if (@intFromPtr(next) + @sizeOf(cmsghdr) > @intFromPtr(end)) {
+            return null;
+        }
+
+        return @ptrCast(@alignCast(next));
+    }
+};
+
+const bsd = struct {};
+
+pub const PktInfo = struct {
+    // network interface index
+    if_index: u64,
+    addr_src: Address, // equivalent `std::net::IpAddr` in Rust
+    addr_dst: EndPoint, // equivalent `std::net::SocketAddr` in Rust
+};
+
+const RecvMsgError = std.posix.RecvFromError || error{
+    NoPktInfo,
+    Interrupted,
+    InsufficientBytes,
+    UnsupportedAddressFamily,
+};
+const SetSockOptError = std.posix.SetSockOptError || error{
+    UnsupportedAddressFamily,
+};
+
+pub const RecvMsgResult = struct {
+    pkt_info: PktInfo,
+    bytes_received: usize,
+};
+
+pub fn recvmsgSetSocketOpt(sock: *Socket) SetSockOptError!void {
+    if (builtin.os.tag == .windows) {
+        const on: c_int = 1;
+        if (sock.family == .ipv4) {
+            try std.posix.setsockopt(
+                sock.internal,
+                std.posix.IPPROTO.IP,
+                win.IP_PKTINFO,
+                std.mem.asBytes(&on),
+            );
+        } else if (sock.family == .ipv6) {
+            return error.UnsupportedAddressFamily;
+        }
+        return;
+    }
+
+    // Set socket options to receive packet info
+    if (sock.family == .ipv4) {
+        const on: c_int = 1;
+        // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/any-macos-any/netinet/in.h#L433-L434
+        const IP_PKTINFO_BSD = 26;
+        const IP_PKTINFO = if (is_linux) std.os.linux.IP.PKTINFO else IP_PKTINFO_BSD;
+        try std.posix.setsockopt(
+            sock.internal,
+            std.posix.IPPROTO.IP,
+            IP_PKTINFO,
+            std.mem.asBytes(&on),
+        );
+    } else if (sock.family == .ipv6) {
+        const on: c_int = 1;
+        // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/any-macos-any/netinet6/in6.h#L456
+        const IPV6_RECVPKTINFO_BSD = 61;
+        const IPV6_RECVPKTINFO = if (is_linux) std.os.linux.IPV6.RECVPKTINFO else IPV6_RECVPKTINFO_BSD;
+        try std.posix.setsockopt(
+            sock.internal,
+            std.posix.IPPROTO.IPV6,
+            IPV6_RECVPKTINFO,
+            std.mem.asBytes(&on),
+        );
+    }
+}
+
+// Return type that includes both packet info and bytes received
+pub fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult {
+    if (comptime is_windows) {
+        return win.recvmsg(sock, data, flags);
+    }
+
+    // Prepare the message header and buffer for control messages
+    var msg: msghdr = undefined;
+    var addr_storage: std.posix.sockaddr.storage = undefined;
+    var iov: [1]iovec = undefined;
+    var control_buffer: [256]u8 = undefined; // Buffer for control messages
+
+    // Set up the message header - use the provided data buffer for payload
+    iov[0].base = data.ptr;
+    iov[0].len = data.len;
+
+    msg.name = @ptrCast(&addr_storage);
+    msg.namelen = @sizeOf(std.posix.sockaddr.storage);
+    msg.iov = &iov;
+    msg.iovlen = 1;
+    msg.control = &control_buffer;
+    msg.controllen = control_buffer.len;
+    msg.flags = 0;
+
+    // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/musl/src/network/recvmsg.c#L20
+    var is_found_pktinfo = false;
+    var pkt_info: PktInfo = undefined;
+    var ret_val: isize = undefined;
+    if (comptime is_linux) {
+        ret_val = @intCast(std.os.linux.recvmsg(sock.internal, &msg, flags));
+    } else if (comptime is_bsd) {
+        ret_val = std.c.recvmsg(sock.internal, &msg, @intCast(flags));
+    } else {
+        @compileError("Unsupported OS: " ++ @tagName(builtin.os.tag));
+    }
+    if (ret_val <= 0) {
+        var errno: std.posix.E = undefined;
+        if (comptime is_linux) {
+            errno = std.os.linux.E.init(@intCast(ret_val));
+        } else if (comptime is_bsd) {
+            errno = std.posix.errno(-1);
+        } else {
+            @compileError("Unsupported OS: " ++ @tagName(builtin.os.tag));
+        }
+        switch (errno) {
+            .BADF => unreachable, // always a race condition
+            .FAULT => unreachable,
+            .INVAL => unreachable,
+            .NOTCONN => return error.SocketNotConnected,
+            .NOTSOCK => unreachable,
+            .INTR => return error.Interrupted,
+            .AGAIN => return error.WouldBlock,
+            .NOMEM => return error.SystemResources,
+            .CONNREFUSED => return error.ConnectionRefused,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+    const bytes_recv: usize = @intCast(ret_val);
+
+    var cmsg = unix.CMSG_FIRSTHDR(&msg);
+    while (cmsg != null) : (cmsg = unix.CMSG_NXTHDR(&msg, cmsg.?)) {
+        const hdr = cmsg.?;
+
+        // IP_PKTINFO: 8 on Linux, 26 on BSD
+        const IP_PKTINFO = if (is_linux) 8 else if (is_bsd) 26 else 8;
+        // IPV6_PKTINFO: 50 on Linux, 46 on BSD
+        const IPV6_PKTINFO = if (is_linux) 50 else if (is_bsd) 46 else 50;
+
+        if (sock.family == .ipv4 and
+            hdr.level == std.posix.IPPROTO.IP and
+            hdr.type == IP_PKTINFO)
+        {
+            const info: *in_pktinfo = @ptrCast(@alignCast(unix.CMSG_DATA(hdr)));
+            pkt_info.if_index = info.ipi_ifindex;
+
+            // Source address (where the packet came from)
+            const src_addr = try EndPoint.fromSocketAddress(@ptrCast(msg.name), msg.namelen);
+            pkt_info.addr_src = src_addr.address;
+
+            // Destination address (where the packet was sent to)
+            pkt_info.addr_dst = EndPoint{
+                .address = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr.s_addr) } },
+                .port = src_addr.port,
+            };
+
+            is_found_pktinfo = true;
+            break;
+        } else if (sock.family == .ipv6 and
+            hdr.level == std.posix.IPPROTO.IPV6 and
+            hdr.type == IPV6_PKTINFO)
+        {
+            // Handle IPv6 packet info
+            const info: *in6_pktinfo = @ptrCast(@alignCast(unix.CMSG_DATA(hdr)));
+            pkt_info.if_index = info.ipi6_ifindex;
+
+            // Source address (where the packet came from)
+            const src_addr = try EndPoint.fromSocketAddress(@ptrCast(msg.name), msg.namelen);
+            pkt_info.addr_src = src_addr.address;
+
+            // Destination address (where the packet was sent to)
+            pkt_info.addr_dst = EndPoint{
+                .address = Address{
+                    .ipv6 = .{
+                        .value = info.ipi6_addr.s6_addr,
+                        .scope_id = 0, // We don't have scope_id in the packet info
+                    },
+                },
+                .port = src_addr.port, // Use the same port
+            };
+
+            is_found_pktinfo = true;
+            break;
+        }
+    }
+
+    if (!is_found_pktinfo) {
+        return error.NoPktInfo;
+    }
+
+    return RecvMsgResult{
+        .pkt_info = pkt_info,
+        .bytes_received = @intCast(bytes_recv),
+    };
+}
+
+test "CMSG macros" {
+    const testing = std.testing;
+
+    // Test CMSG_ALIGN
+    try testing.expectEqual(@as(usize, 8), unix.CMSG_ALIGN(1));
+    try testing.expectEqual(@as(usize, 8), unix.CMSG_ALIGN(8));
+    try testing.expectEqual(@as(usize, 16), unix.CMSG_ALIGN(9));
+
+    // Test CMSG_LEN
+    const cmsg_size = @sizeOf(unix.cmsghdr);
+    const aligned_cmsg_size = unix.CMSG_ALIGN(cmsg_size);
+    try testing.expectEqual(aligned_cmsg_size + 0, unix.CMSG_LEN(0));
+    try testing.expectEqual(aligned_cmsg_size + 4, unix.CMSG_LEN(4));
+
+    // Test CMSG_SPACE
+    try testing.expectEqual(unix.CMSG_ALIGN(0) + aligned_cmsg_size, unix.CMSG_SPACE(0));
+    try testing.expectEqual(unix.CMSG_ALIGN(4) + aligned_cmsg_size, unix.CMSG_SPACE(4));
+
+    // Create a buffer large enough for a control message
+    var buffer: [256]u8 = undefined;
+
+    // Create a message header
+    var msg: msghdr = undefined;
+    msg.control = &buffer;
+    msg.controllen = buffer.len;
+
+    // Test CMSG_FIRSTHDR
+    const first_hdr = unix.CMSG_FIRSTHDR(&msg);
+    try testing.expect(first_hdr != null);
+
+    // Initialize the first header
+    if (first_hdr) |hdr| {
+        hdr.len = @intCast(unix.CMSG_LEN(4));
+        hdr.level = 1;
+        hdr.type = 2;
+
+        // Get data pointer and write some data
+        const data_ptr = unix.CMSG_DATA(hdr);
+        data_ptr[0] = 0xAA;
+        data_ptr[1] = 0xBB;
+        data_ptr[2] = 0xCC;
+        data_ptr[3] = 0xDD;
+
+        // Test CMSG_NXTHDR
+        msg.controllen = hdr.len;
+        const next_hdr = unix.CMSG_NXTHDR(&msg, hdr);
+        try testing.expect(next_hdr == null); // Should be null since we only have one header
+
+        // Test with enough space for another header
+        msg.controllen = buffer.len;
+        const next_hdr2 = unix.CMSG_NXTHDR(&msg, hdr);
+        try testing.expect(next_hdr2 != null);
+
+        // Test __CMSG_LEN and __CMSG_NEXT
+        const len = unix.__CMSG_LEN(hdr);
+        try testing.expect(len >= hdr.len);
+        try testing.expect(len % @sizeOf(usize) == 0); // Should be aligned
+
+        const next_ptr = unix.__CMSG_NEXT(hdr);
+        try testing.expect(@intFromPtr(next_ptr) > @intFromPtr(hdr));
+        try testing.expect(@intFromPtr(next_ptr) == @intFromPtr(hdr) + len);
+    }
+}
+
+const win = struct {
+    // Control message buffer sizes
+    const CMSG_HEADER_SIZE: usize = @sizeOf(CMSGHDR);
+    const PKTINFOV4_DATA_SIZE: usize = @sizeOf(IN_PKTINFO);
+    const PKTINFOV6_DATA_SIZE: usize = @sizeOf(IN6_PKTINFO);
+    const CONTROL_PKTINFOV4_BUFFER_SIZE: usize = CMSG_HEADER_SIZE + PKTINFOV4_DATA_SIZE;
+    const CONTROL_PKTINFOV6_BUFFER_SIZE: usize = CMSG_HEADER_SIZE + PKTINFOV6_DATA_SIZE + 8; // Add padding
+
+    // Windows-specific structures
+    // These structures aren't available in std.os.windows.ws2_32
+    // Based on Windows SDK headers and the rust-lang/socket-pktinfo implementation
+    const CMSGHDR = extern struct {
+        cmsg_len: usize,
+        cmsg_level: i32,
+        cmsg_type: i32,
+    };
+
+    const IN_PKTINFO = extern struct {
+        ipi_addr: struct {
+            S_un: struct {
+                S_addr: u32,
+            },
+        },
+        ipi_ifindex: u32,
+    };
+
+    const IN6_PKTINFO = extern struct {
+        ipi6_addr: struct {
+            u: struct {
+                Byte: [16]u8,
+            },
+        },
+        ipi6_ifindex: u32,
+    };
+
+    // Use standard library definitions where available
+    const WSABUF = std.os.windows.ws2_32.WSABUF;
+    const WSAMSG = std.os.windows.ws2_32.WSAMSG;
+
+    // Socket option constants from standard library
+    const IP_PKTINFO: i32 = std.os.windows.ws2_32.IP_PKTINFO;
+    const IPV6_PKTINFO: i32 = std.os.windows.ws2_32.IPV6_PKTINFO;
+    const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = std.os.windows.ws2_32.SIO_GET_EXTENSION_FUNCTION_POINTER;
+
+    // Extensions function ID
+    const LPFN_WSARECVMSG = std.os.windows.ws2_32.LPFN_WSARECVMSG;
+    const WSAID_WSARECVMSG = std.os.windows.ws2_32.WSAID_WSARECVMSG;
+
+    /// Locate the WSARecvMsg extension function
+    fn locateWsaRecvMsg(socket: std.posix.socket_t) !LPFN_WSARECVMSG {
+        var fn_pointer: usize = 0;
+        var byte_len: u32 = 0;
+
+        // Get the function pointer using WSAIoctl
+        const r = windows.ws2_32.WSAIoctl(
+            socket,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            @constCast(@ptrCast(&WSAID_WSARECVMSG)),
+            @sizeOf(@TypeOf(WSAID_WSARECVMSG)),
+            @ptrCast(&fn_pointer),
+            @sizeOf(@TypeOf(fn_pointer)),
+            &byte_len,
+            null,
+            null,
+        );
+
+        if (r != 0) return error.ExtensionFunctionNotFound;
+
+        if (@sizeOf(usize) != byte_len)
+            return error.InvalidExtensionFunction;
+
+        const cast_fn: LPFN_WSARECVMSG = @ptrCast(@alignCast(fn_pointer));
+        if (cast_fn == null) return error.ExtensionFunctionNotFound;
+
+        return cast_fn;
+    }
+
+    pub fn recvmsg(socket: *Socket, data: []u8, flags: u32) !RecvMsgResult {
+        const recvmsg_fn = try win.locateWsaRecvMsg(socket.internal);
+
+        // Prepare address storage for the sender
+        var addr_storage: std.posix.sockaddr.storage = undefined;
+        const addr_len: i32 = @sizeOf(@TypeOf(addr_storage));
+
+        // Prepare control message buffer based on socket family
+        var control_buffer: [256]u8 = undefined;
+
+        // Create the WSA buffer for data
+        var wsa_buf = win.WSABUF{
+            .len = @intCast(data.len),
+            .buf = data.ptr,
+        };
+
+        // Create the WSA message structure
+        var wsa_msg = win.WSAMSG{
+            .name = @ptrCast(&addr_storage),
+            .namelen = addr_len,
+            .lpBuffers = @ptrCast(&wsa_buf),
+            .dwBufferCount = 1,
+            .Control = win.WSABUF{
+                .len = @intCast(control_buffer.len),
+                .buf = &control_buffer,
+            },
+            .dwFlags = @intCast(flags),
+        };
+
+        // Call WSARecvMsg
+        var bytes_received: u32 = 0;
+        const result = recvmsg_fn.?(
+            socket.internal,
+            &wsa_msg,
+            &bytes_received,
+            null,
+            null,
+        );
+
+        if (result != 0) {
+            const err = windows.ws2_32.WSAGetLastError();
+            switch (err) {
+                .WSAEMSGSIZE => return error.MessageTooBig,
+                .WSAEWOULDBLOCK => return error.WouldBlock,
+                .WSAEFAULT => unreachable,
+                .WSAEINVAL => unreachable,
+                .WSAEINTR => return error.Interrupted,
+                .WSAETIMEDOUT => return error.ConnectionTimedOut,
+                else => return error.NetworkSubsystemFailed,
+            }
+        }
+
+        if (bytes_received == 0) {
+            return error.ConnectionClosed;
+        }
+
+        // Process control messages to extract packet info
+        var pkt_info: PktInfo = undefined;
+        var pkt_info_found = false;
+
+        // Get source address from the sender
+        const src_addr = try EndPoint.fromSocketAddress(@ptrCast(wsa_msg.name), @intCast(wsa_msg.namelen));
+        pkt_info.addr_src = src_addr.address;
+
+        // Process control messages to extract destination address and interface
+        var cmsg_ptr: [*]u8 = &control_buffer;
+        var control_len = wsa_msg.Control.len;
+
+        while (control_len >= @sizeOf(win.CMSGHDR)) {
+            const cmsg: *win.CMSGHDR = @ptrCast(@alignCast(cmsg_ptr));
+
+            if (cmsg.cmsg_len < @sizeOf(win.CMSGHDR)) {
+                break;
+            }
+
+            if (socket.family == .ipv4 and
+                cmsg.cmsg_level == std.posix.IPPROTO.IP and
+                cmsg.cmsg_type == win.IP_PKTINFO)
+            {
+                if (cmsg.cmsg_len >= @sizeOf(win.CMSGHDR) + @sizeOf(win.IN_PKTINFO)) {
+                    const info: *win.IN_PKTINFO = @ptrCast(@alignCast(cmsg_ptr + @sizeOf(win.CMSGHDR)));
+
+                    pkt_info.if_index = info.ipi_ifindex;
+                    pkt_info.addr_dst = EndPoint{
+                        .address = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr.S_un.S_addr) } },
+                        .port = src_addr.port,
+                    };
+
+                    pkt_info_found = true;
+                }
+            } else if (socket.family == .ipv6 and
+                cmsg.cmsg_level == std.posix.IPPROTO.IPV6 and
+                cmsg.cmsg_type == win.IPV6_PKTINFO)
+            {
+                if (cmsg.cmsg_len >= @sizeOf(win.CMSGHDR) + @sizeOf(win.IN6_PKTINFO)) {
+                    const info: *win.IN6_PKTINFO = @ptrCast(@alignCast(cmsg_ptr + @sizeOf(win.CMSGHDR)));
+
+                    pkt_info.if_index = info.ipi6_ifindex;
+                    pkt_info.addr_dst = EndPoint{
+                        .address = Address{
+                            .ipv6 = .{
+                                .value = info.ipi6_addr.u.Byte,
+                                .scope_id = 0,
+                            },
+                        },
+                        .port = src_addr.port,
+                    };
+
+                    pkt_info_found = true;
+                }
+            }
+
+            // Move to next control message
+            const next_offset = @as(usize, (cmsg.cmsg_len + 7) & ~@as(usize, 7)); // Align to 8 bytes
+            cmsg_ptr += next_offset;
+            if (control_len < next_offset) {
+                break;
+            }
+            control_len -= @intCast(next_offset);
+        }
+
+        if (!pkt_info_found) {
+            return error.NoPktInfo;
+        }
+
+        return RecvMsgResult{
+            .pkt_info = pkt_info,
+            .bytes_received = bytes_received,
+        };
+    }
+};
+
+test "Windows CMSG structures" {
+    if (!is_windows) return;
+
+    const testing = std.testing;
+
+    // Test the size of control message buffer
+    try testing.expectEqual(@sizeOf(win.CMSGHDR), win.CMSG_HEADER_SIZE);
+
+    // Test buffer sizes
+    const pktinfov4_buffer_size = win.CONTROL_PKTINFOV4_BUFFER_SIZE;
+    try testing.expect(pktinfov4_buffer_size >= @sizeOf(win.CMSGHDR) + @sizeOf(win.IN_PKTINFO));
+
+    const pktinfov6_buffer_size = win.CONTROL_PKTINFOV6_BUFFER_SIZE;
+    try testing.expect(pktinfov6_buffer_size >= @sizeOf(win.CMSGHDR) + @sizeOf(win.IN6_PKTINFO));
+
+    // Create a fake IPv4 packet info for testing
+    const ipv4_pktinfo = win.IN_PKTINFO{
+        .ipi_addr = .{ .S_un = .{ .S_addr = 0x0100007F } }, // 127.0.0.1
+        .ipi_ifindex = 1,
+    };
+
+    try testing.expectEqual(@as(u32, 0x0100007F), ipv4_pktinfo.ipi_addr.S_un.S_addr);
+    try testing.expectEqual(@as(u32, 1), ipv4_pktinfo.ipi_ifindex);
+
+    // Create a fake IPv6 packet info for testing
+    const ipv6_pktinfo = win.IN6_PKTINFO{
+        .ipi6_addr = .{ .u = .{ .Byte = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } } }, // ::1
+        .ipi6_ifindex = 1,
+    };
+
+    try testing.expectEqual(@as(u32, 1), ipv6_pktinfo.ipi6_ifindex);
+    try testing.expectEqual(@as(u8, 1), ipv6_pktinfo.ipi6_addr.u.Byte[15]);
+}
