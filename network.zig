@@ -839,6 +839,12 @@ pub const Socket = struct {
     /// Multicast enables sending packets to the group and all joined peers
     /// will receive the sent data.
     pub fn joinMulticastGroup(self: Self, group: MulticastGroup) !void {
+        // Windows uses a different structure for IP_ADD_MEMBERSHIP
+        if (is_windows) {
+            return win.joinMulticastGroup(self, group);
+        }
+
+        // Unix implementation
         const ip_mreq = extern struct {
             imr_multiaddr: u32,
             imr_address: u32,
@@ -851,7 +857,9 @@ pub const Socket = struct {
             .imr_ifindex = 0, // this cannot be crossplatform, so we set it to zero
         };
 
-        const IP_ADD_MEMBERSHIP = if (is_windows) 5 else if (is_bsd) 12 else 35;
+        const IP_ADD_MEMBERSHIP_BSD = 12;
+        const IP_ADD_MEMBERSHIP_LINUX = std.os.linux.IP.ADD_MEMBERSHIP;
+        const IP_ADD_MEMBERSHIP = if (is_bsd) IP_ADD_MEMBERSHIP_BSD else IP_ADD_MEMBERSHIP_LINUX;
         const level = if (is_bsd) std.posix.IPPROTO.IP else std.posix.SOL.SOCKET;
 
         try std.posix.setsockopt(
@@ -1695,7 +1703,7 @@ const unix = struct {
     // CMSG macros implementation in Zig
     // Based on musl implementation which is more robust
     fn CMSG_ALIGN(len: usize) usize {
-        return (len + @sizeOf(usize) - 1) & ~(@as(usize, @sizeOf(usize) - 1));
+        return std.mem.alignForward(usize, len, @sizeOf(usize));
     }
 
     fn CMSG_LEN(len: usize) usize {
@@ -1712,7 +1720,8 @@ const unix = struct {
     }
 
     fn __CMSG_LEN(cmsg: *const cmsghdr) usize {
-        return (cmsg.len + @sizeOf(usize) - 1) & ~(@as(usize, @sizeOf(usize) - 1));
+        // (len + @sizeOf(usize) - 1) & ~(@as(usize, @sizeOf(usize) - 1))
+        return std.mem.alignForward(usize, cmsg.len, @sizeOf(usize));
     }
 
     fn __CMSG_NEXT(cmsg: *const cmsghdr) [*]u8 {
@@ -1762,6 +1771,9 @@ const RecvMsgError = std.posix.RecvFromError || error{
     Interrupted,
     InsufficientBytes,
     UnsupportedAddressFamily,
+    ExtensionFunctionNotFound,
+    InvalidExtensionFunction,
+    ConnectionClosed,
 };
 const SetSockOptError = std.posix.SetSockOptError || error{
     UnsupportedAddressFamily,
@@ -1778,12 +1790,17 @@ pub fn recvmsgSetSocketOpt(sock: *Socket) SetSockOptError!void {
         if (sock.family == .ipv4) {
             try std.posix.setsockopt(
                 sock.internal,
-                std.posix.IPPROTO.IP,
+                std.os.windows.ws2_32.IPPROTO.IP,
                 win.IP_PKTINFO,
                 std.mem.asBytes(&on),
             );
         } else if (sock.family == .ipv6) {
-            return error.UnsupportedAddressFamily;
+            try std.posix.setsockopt(
+                sock.internal,
+                std.os.windows.ws2_32.IPPROTO.IP,
+                win.IPV6_PKTINFO,
+                std.mem.asBytes(&on),
+            );
         }
         return;
     }
@@ -1820,11 +1837,10 @@ pub fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult
         return win.recvmsg(sock, data, flags);
     }
 
-    // Prepare the message header and buffer for control messages
     var msg: msghdr = undefined;
     var addr_storage: std.posix.sockaddr.storage = undefined;
     var iov: [1]iovec = undefined;
-    var control_buffer: [256]u8 = undefined; // Buffer for control messages
+    var control_buffer: [256]u8 = undefined;
 
     // Set up the message header - use the provided data buffer for payload
     iov[0].base = data.ptr;
@@ -2022,22 +2038,25 @@ const win = struct {
         cmsg_type: i32,
     };
 
+    // Use a flat structure for IN_PKTINFO to make it extern-compatible
     const IN_PKTINFO = extern struct {
-        ipi_addr: struct {
-            S_un: struct {
-                S_addr: u32,
-            },
-        },
+        ipi_addr_s_addr: u32, // Equivalent to S_un.S_addr
         ipi_ifindex: u32,
     };
 
+    // Use a flat structure for IN6_PKTINFO to make it extern-compatible
     const IN6_PKTINFO = extern struct {
-        ipi6_addr: struct {
-            u: struct {
-                Byte: [16]u8,
-            },
-        },
+        ipi6_addr: [16]u8, // Equivalent to u.Byte
         ipi6_ifindex: u32,
+    };
+
+    const IN_ADDR = extern struct {
+        s_addr: u32,
+    };
+
+    const ip_mreq = extern struct {
+        imr_multiaddr: IN_ADDR,
+        imr_interface: IN_ADDR,
     };
 
     // Use standard library definitions where available
@@ -2076,9 +2095,12 @@ const win = struct {
         if (@sizeOf(usize) != byte_len)
             return error.InvalidExtensionFunction;
 
-        const cast_fn: LPFN_WSARECVMSG = @ptrCast(@alignCast(fn_pointer));
-        if (cast_fn == null) return error.ExtensionFunctionNotFound;
+        // Convert the usize to a function pointer
+        const ptr: *anyopaque = @ptrFromInt(fn_pointer);
+        const cast_fn: LPFN_WSARECVMSG = @ptrCast(ptr);
 
+        // We can't check if cast_fn is null since it's not an optional pointer
+        // Just return the function pointer
         return cast_fn;
     }
 
@@ -2113,7 +2135,7 @@ const win = struct {
 
         // Call WSARecvMsg
         var bytes_received: u32 = 0;
-        const result = recvmsg_fn.?(
+        const result = recvmsg_fn(
             socket.internal,
             &wsa_msg,
             &bytes_received,
@@ -2158,7 +2180,7 @@ const win = struct {
             }
 
             if (socket.family == .ipv4 and
-                cmsg.cmsg_level == std.posix.IPPROTO.IP and
+                cmsg.cmsg_level == std.os.windows.ws2_32.IPPROTO.IP and
                 cmsg.cmsg_type == win.IP_PKTINFO)
             {
                 if (cmsg.cmsg_len >= @sizeOf(win.CMSGHDR) + @sizeOf(win.IN_PKTINFO)) {
@@ -2166,14 +2188,14 @@ const win = struct {
 
                     pkt_info.if_index = info.ipi_ifindex;
                     pkt_info.addr_dst = EndPoint{
-                        .address = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr.S_un.S_addr) } },
+                        .address = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr_s_addr) } },
                         .port = src_addr.port,
                     };
 
                     pkt_info_found = true;
                 }
             } else if (socket.family == .ipv6 and
-                cmsg.cmsg_level == std.posix.IPPROTO.IPV6 and
+                cmsg.cmsg_level == std.os.windows.ws2_32.IPPROTO.IP and
                 cmsg.cmsg_type == win.IPV6_PKTINFO)
             {
                 if (cmsg.cmsg_len >= @sizeOf(win.CMSGHDR) + @sizeOf(win.IN6_PKTINFO)) {
@@ -2183,7 +2205,7 @@ const win = struct {
                     pkt_info.addr_dst = EndPoint{
                         .address = Address{
                             .ipv6 = .{
-                                .value = info.ipi6_addr.u.Byte,
+                                .value = info.ipi6_addr,
                                 .scope_id = 0,
                             },
                         },
@@ -2195,7 +2217,7 @@ const win = struct {
             }
 
             // Move to next control message
-            const next_offset = @as(usize, (cmsg.cmsg_len + 7) & ~@as(usize, 7)); // Align to 8 bytes
+            const next_offset = std.mem.alignForward(usize, cmsg.cmsg_len, 8); // Align to 8 bytes
             cmsg_ptr += next_offset;
             if (control_len < next_offset) {
                 break;
@@ -2211,6 +2233,24 @@ const win = struct {
             .pkt_info = pkt_info,
             .bytes_received = bytes_received,
         };
+    }
+
+    pub fn joinMulticastGroup(self: *Socket, group: Socket.MulticastGroup) !void {
+        // https://learn.microsoft.com/en-us/windows/win32/winsock/multicast-programming-sample
+        // https://learn.microsoft.com/en-us/windows/win32/api/ws2ipdef/ns-ws2ipdef-ip_mreq_source
+        // https://learn.microsoft.com/en-us/windows/win32/api/ws2ipdef/ns-ws2ipdef-ip_mreq
+        const request = ip_mreq{
+            .imr_multiaddr = IN_ADDR{ .s_addr = @bitCast(group.group.value) },
+            .imr_interface = IN_ADDR{ .s_addr = @bitCast(group.interface.value) },
+        };
+
+        try std.posix.setsockopt(
+            self.internal,
+            std.os.windows.ws2_32.IPPROTO.IP,
+            std.os.windows.ws2_32.IP_ADD_MEMBERSHIP,
+            std.mem.asBytes(&request),
+        );
+        return;
     }
 };
 
@@ -2231,19 +2271,19 @@ test "Windows CMSG structures" {
 
     // Create a fake IPv4 packet info for testing
     const ipv4_pktinfo = win.IN_PKTINFO{
-        .ipi_addr = .{ .S_un = .{ .S_addr = 0x0100007F } }, // 127.0.0.1
+        .ipi_addr_s_addr = 0x0100007F, // 127.0.0.1
         .ipi_ifindex = 1,
     };
 
-    try testing.expectEqual(@as(u32, 0x0100007F), ipv4_pktinfo.ipi_addr.S_un.S_addr);
+    try testing.expectEqual(@as(u32, 0x0100007F), ipv4_pktinfo.ipi_addr_s_addr);
     try testing.expectEqual(@as(u32, 1), ipv4_pktinfo.ipi_ifindex);
 
     // Create a fake IPv6 packet info for testing
     const ipv6_pktinfo = win.IN6_PKTINFO{
-        .ipi6_addr = .{ .u = .{ .Byte = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } } }, // ::1
+        .ipi6_addr = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, // ::1
         .ipi6_ifindex = 1,
     };
 
     try testing.expectEqual(@as(u32, 1), ipv6_pktinfo.ipi6_ifindex);
-    try testing.expectEqual(@as(u8, 1), ipv6_pktinfo.ipi6_addr.u.Byte[15]);
+    try testing.expectEqual(@as(u8, 1), ipv6_pktinfo.ipi6_addr[15]);
 }
