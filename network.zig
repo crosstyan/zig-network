@@ -844,14 +844,20 @@ pub const Socket = struct {
             return win.joinMulticastGroup(self, group);
         }
 
-        // Unix implementation
-        const ip_mreq = extern struct {
-            imr_multiaddr: u32,
-            imr_address: u32,
-            imr_ifindex: u32,
+        const ip_mreqn = extern struct {
+            imr_multiaddr: c_int,
+            imr_address: c_int,
+            // FreeBSD: https://man.freebsd.org/cgi/man.cgi?query=ip&sektion=4
+            //  if imr_ifindex is 0, kernel will use IP address from
+            //  imr_interface to lookup the interface.
+            // Linux: https://man7.org/linux/man-pages/man7/ip.7.html
+            //  imr_ifindex is the interface index of the interface that should
+            //  join/leave the imr_multiaddr group, or 0 to indicate any
+            //  interface.
+            imr_ifindex: c_int,
         };
 
-        const request = ip_mreq{
+        const request = ip_mreqn{
             .imr_multiaddr = @bitCast(group.group.value),
             .imr_address = @bitCast(group.interface.value),
             .imr_ifindex = 0, // this cannot be crossplatform, so we set it to zero
@@ -2239,6 +2245,10 @@ const win = struct {
         // https://learn.microsoft.com/en-us/windows/win32/winsock/multicast-programming-sample
         // https://learn.microsoft.com/en-us/windows/win32/api/ws2ipdef/ns-ws2ipdef-ip_mreq_source
         // https://learn.microsoft.com/en-us/windows/win32/api/ws2ipdef/ns-ws2ipdef-ip_mreq
+        //
+        // Note that `IP_ADD_MEMBERSHIP` is from `IGMPv2` to receive any multicast
+        // without specifying the source address.
+        // `IP_ADD_SOURCE_MEMBERSHIP` is from `IGMPv3` to receive multicast from a specific source.
         const request = ip_mreq{
             .imr_multiaddr = IN_ADDR{ .s_addr = @bitCast(group.group.value) },
             .imr_interface = IN_ADDR{ .s_addr = @bitCast(group.interface.value) },
