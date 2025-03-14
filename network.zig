@@ -1783,8 +1783,8 @@ const bsd = struct {};
 pub const PktInfo = struct {
     // network interface index
     if_index: u64,
-    addr_src: Address, // equivalent `std::net::IpAddr` in Rust
-    addr_dst: EndPoint, // equivalent `std::net::SocketAddr` in Rust
+    addr_src: EndPoint, // equivalent `std::net::IpAddr` in Rust
+    addr_dst: Address, // equivalent `std::net::SocketAddr` in Rust
 };
 
 const RecvMsgError = std.posix.RecvFromError || error{
@@ -1928,13 +1928,12 @@ pub fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult
             const info: *in_pktinfo = @ptrCast(@alignCast(unix.CMSG_DATA(hdr)));
             pkt_info.if_index = info.ipi_ifindex;
 
-            // Source address (where the packet came from)
             const src_addr = try EndPoint.fromSocketAddress(@ptrCast(msg.name), msg.namelen);
-            pkt_info.addr_src = src_addr.address;
+            const dst_addr = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr.s_addr) } };
+            pkt_info.addr_dst = dst_addr;
 
-            // Destination address (where the packet was sent to)
-            pkt_info.addr_dst = EndPoint{
-                .address = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr.s_addr) } },
+            pkt_info.addr_src = EndPoint{
+                .address = src_addr.address,
                 .port = src_addr.port,
             };
 
@@ -1950,17 +1949,12 @@ pub fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult
 
             // Source address (where the packet came from)
             const src_addr = try EndPoint.fromSocketAddress(@ptrCast(msg.name), msg.namelen);
-            pkt_info.addr_src = src_addr.address;
+            const dst_addr = Address{ .ipv6 = .{ .value = info.ipi6_addr.s6_addr, .scope_id = 0 } };
+            pkt_info.addr_dst = dst_addr;
 
-            // Destination address (where the packet was sent to)
-            pkt_info.addr_dst = EndPoint{
-                .address = Address{
-                    .ipv6 = .{
-                        .value = info.ipi6_addr.s6_addr,
-                        .scope_id = 0, // We don't have scope_id in the packet info
-                    },
-                },
-                .port = src_addr.port, // Use the same port
+            pkt_info.addr_src = EndPoint{
+                .address = src_addr.address,
+                .port = src_addr.port,
             };
 
             is_found_pktinfo = true;
@@ -2187,7 +2181,10 @@ const win = struct {
 
         // Get source address from the sender
         const src_addr = try EndPoint.fromSocketAddress(@ptrCast(wsa_msg.name), @intCast(wsa_msg.namelen));
-        pkt_info.addr_src = src_addr.address;
+        pkt_info.addr_src = EndPoint{
+            .address = src_addr.address,
+            .port = src_addr.port,
+        };
 
         // Process control messages to extract destination address and interface
         var cmsg_ptr: [*]u8 = &control_buffer;
@@ -2208,10 +2205,7 @@ const win = struct {
                     const info: *win.IN_PKTINFO = @ptrCast(@alignCast(cmsg_ptr + @sizeOf(win.CMSGHDR)));
 
                     pkt_info.if_index = info.ipi_ifindex;
-                    pkt_info.addr_dst = EndPoint{
-                        .address = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr_s_addr) } },
-                        .port = src_addr.port,
-                    };
+                    pkt_info.addr_dst = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr_s_addr) } };
 
                     pkt_info_found = true;
                 }
@@ -2223,14 +2217,11 @@ const win = struct {
                     const info: *win.IN6_PKTINFO = @ptrCast(@alignCast(cmsg_ptr + @sizeOf(win.CMSGHDR)));
 
                     pkt_info.if_index = info.ipi6_ifindex;
-                    pkt_info.addr_dst = EndPoint{
-                        .address = Address{
-                            .ipv6 = .{
-                                .value = info.ipi6_addr,
-                                .scope_id = 0,
-                            },
+                    pkt_info.addr_dst = Address{
+                        .ipv6 = .{
+                            .value = info.ipi6_addr,
+                            .scope_id = 0,
                         },
-                        .port = src_addr.port,
                     };
 
                     pkt_info_found = true;
