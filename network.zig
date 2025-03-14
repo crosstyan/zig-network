@@ -31,6 +31,8 @@ pub fn deinit() void {
     }
 }
 
+const IPv4ParseError = std.net.IPv4ParseError;
+
 /// A network address abstraction. Contains one member for each possible type of address.
 pub const Address = union(AddressFamily) {
     ipv4: IPv4,
@@ -91,34 +93,47 @@ pub const Address = union(AddressFamily) {
             try writer.writeAll(s);
         }
 
-        pub fn parse(string: []const u8) !IPv4 {
-            var dot_it = std.mem.splitScalar(u8, string, '.');
+        pub fn parse(buf: []const u8) IPv4ParseError!IPv4 {
+            // steal from std.net implementation
+            var result: IPv4 = undefined;
+            const out_ptr = std.mem.asBytes(&result.value);
 
-            const d0 = dot_it.next().?; // is always != null
-            const d1 = dot_it.next();
-            const d2 = dot_it.next();
-            const d3 = dot_it.next();
-
-            var ip = IPv4{ .value = undefined };
-            if (d3 != null) {
-                ip.value[0] = try std.fmt.parseInt(u8, d0, 10);
-                ip.value[1] = try std.fmt.parseInt(u8, d1.?, 10);
-                ip.value[2] = try std.fmt.parseInt(u8, d2.?, 10);
-                ip.value[3] = try std.fmt.parseInt(u8, d3.?, 10);
-            } else if (d2 != null) {
-                ip.value[0] = try std.fmt.parseInt(u8, d0, 10);
-                ip.value[1] = try std.fmt.parseInt(u8, d1.?, 10);
-                const int = try std.fmt.parseInt(u16, d2.?, 10);
-                std.mem.writeInt(u16, ip.value[2..4], int, .big);
-            } else if (d1 != null) {
-                ip.value[0] = try std.fmt.parseInt(u8, d0, 10);
-                const int = try std.fmt.parseInt(u24, d1.?, 10);
-                std.mem.writeInt(u24, ip.value[1..4], int, .big);
-            } else {
-                const int = try std.fmt.parseInt(u32, d0, 10);
-                std.mem.writeInt(u32, &ip.value, int, .big);
+            var x: u8 = 0;
+            var index: u8 = 0;
+            var saw_any_digits = false;
+            var has_zero_prefix = false;
+            for (buf) |c| {
+                if (c == '.') {
+                    if (!saw_any_digits) {
+                        return error.InvalidCharacter;
+                    }
+                    if (index == 3) {
+                        return error.InvalidEnd;
+                    }
+                    out_ptr[index] = x;
+                    index += 1;
+                    x = 0;
+                    saw_any_digits = false;
+                    has_zero_prefix = false;
+                } else if (c >= '0' and c <= '9') {
+                    if (c == '0' and !saw_any_digits) {
+                        has_zero_prefix = true;
+                    } else if (has_zero_prefix) {
+                        return error.NonCanonical;
+                    }
+                    saw_any_digits = true;
+                    x = try std.math.mul(u8, x, 10);
+                    x = try std.math.add(u8, x, c - '0');
+                } else {
+                    return error.InvalidCharacter;
+                }
             }
-            return ip;
+            if (index == 3 and saw_any_digits) {
+                out_ptr[index] = x;
+                return result;
+            }
+
+            return error.Incomplete;
         }
 
         pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !IPv4 {
@@ -841,7 +856,7 @@ pub const Socket = struct {
     pub fn joinMulticastGroup(self: Self, group: MulticastGroup) !void {
         // Windows uses a different structure for IP_ADD_MEMBERSHIP
         if (is_windows) {
-            return win.joinMulticastGroup(self, group);
+            return win.joinMulticastGroup(self.internal, group);
         }
 
         const ip_mreqn = extern struct {
@@ -2241,7 +2256,7 @@ const win = struct {
         };
     }
 
-    pub fn joinMulticastGroup(self: *Socket, group: Socket.MulticastGroup) !void {
+    pub fn joinMulticastGroup(self: std.posix.socket_t, group: Socket.MulticastGroup) !void {
         // https://learn.microsoft.com/en-us/windows/win32/winsock/multicast-programming-sample
         // https://learn.microsoft.com/en-us/windows/win32/api/ws2ipdef/ns-ws2ipdef-ip_mreq_source
         // https://learn.microsoft.com/en-us/windows/win32/api/ws2ipdef/ns-ws2ipdef-ip_mreq
@@ -2255,7 +2270,7 @@ const win = struct {
         };
 
         try std.posix.setsockopt(
-            self.internal,
+            self,
             std.os.windows.ws2_32.IPPROTO.IP,
             std.os.windows.ws2_32.IP_ADD_MEMBERSHIP,
             std.mem.asBytes(&request),
