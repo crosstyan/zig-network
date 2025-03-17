@@ -856,7 +856,7 @@ pub const Socket = struct {
     pub fn joinMulticastGroup(self: Self, group: MulticastGroup) !void {
         // Windows uses a different structure for IP_ADD_MEMBERSHIP
         if (is_windows) {
-            return win.joinMulticastGroup(self.internal, group);
+            return windows.joinMulticastGroup(self.internal, group);
         }
 
         const ip_mreqn = extern struct {
@@ -1499,10 +1499,60 @@ const windows = struct {
     pub const WSASocketW = std.os.windows.WSASocketW;
     pub const WSAStartup = std.os.windows.WSAStartup;
 
+    // Control message buffer sizes
+    const CMSG_HEADER_SIZE: usize = @sizeOf(CMSGHDR);
+    const PKTINFOV4_DATA_SIZE: usize = @sizeOf(IN_PKTINFO);
+    const PKTINFOV6_DATA_SIZE: usize = @sizeOf(IN6_PKTINFO);
+    const CONTROL_PKTINFOV4_BUFFER_SIZE: usize = CMSG_HEADER_SIZE + PKTINFOV4_DATA_SIZE;
+    const CONTROL_PKTINFOV6_BUFFER_SIZE: usize = CMSG_HEADER_SIZE + PKTINFOV6_DATA_SIZE + 8; // Add padding
+
+    // Windows-specific structures
+    // These structures aren't available in std.os.windows.ws2_32
+    // Based on Windows SDK headers and the rust-lang/socket-pktinfo implementation
+    const CMSGHDR = extern struct {
+        cmsg_len: usize,
+        cmsg_level: i32,
+        cmsg_type: i32,
+    };
+
+    // Use a flat structure for IN_PKTINFO to make it extern-compatible
+    const IN_PKTINFO = extern struct {
+        ipi_addr_s_addr: u32, // Equivalent to S_un.S_addr
+        ipi_ifindex: u32,
+    };
+
+    // Use a flat structure for IN6_PKTINFO to make it extern-compatible
+    const IN6_PKTINFO = extern struct {
+        ipi6_addr: [16]u8, // Equivalent to u.Byte
+        ipi6_ifindex: u32,
+    };
+
+    const IN_ADDR = extern struct {
+        s_addr: u32,
+    };
+
+    const ip_mreq = extern struct {
+        imr_multiaddr: IN_ADDR,
+        imr_interface: IN_ADDR,
+    };
+
     const timeval = extern struct {
         tv_sec: c_long,
         tv_usec: c_long,
     };
+
+    // Use standard library definitions where available
+    const WSABUF = ws2_32.WSABUF;
+    const WSAMSG = ws2_32.WSAMSG;
+
+    // Socket option constants from standard library
+    const IP_PKTINFO: i32 = ws2_32.IP_PKTINFO;
+    const IPV6_PKTINFO: i32 = ws2_32.IPV6_PKTINFO;
+    const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = ws2_32.SIO_GET_EXTENSION_FUNCTION_POINTER;
+
+    // Extensions function ID
+    const LPFN_WSARECVMSG = ws2_32.LPFN_WSARECVMSG;
+    const WSAID_WSARECVMSG = ws2_32.WSAID_WSARECVMSG;
 
     const funcs = struct {
         extern "ws2_32" fn recvfrom(s: ws2_32.SOCKET, buf: [*c]u8, len: c_int, flags: c_int, from: [*c]std.posix.sockaddr, fromlen: [*c]std.posix.socklen_t) callconv(std.os.windows.WINAPI) c_int;
@@ -1618,29 +1668,191 @@ const windows = struct {
                 else => |err| return unexpectedWSAError(err),
             };
     }
+
+    /// Locate the WSARecvMsg extension function
+    fn locateWsaRecvMsg(skt: std.posix.socket_t) !LPFN_WSARECVMSG {
+        var fn_pointer: usize = 0;
+        var byte_len: u32 = 0;
+
+        // Get the function pointer using WSAIoctl
+        const r = windows.ws2_32.WSAIoctl(
+            skt,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            @constCast(@ptrCast(&WSAID_WSARECVMSG)),
+            @sizeOf(@TypeOf(WSAID_WSARECVMSG)),
+            @ptrCast(&fn_pointer),
+            @sizeOf(@TypeOf(fn_pointer)),
+            &byte_len,
+            null,
+            null,
+        );
+
+        if (r != 0) return error.ExtensionFunctionNotFound;
+
+        if (@sizeOf(usize) != byte_len)
+            return error.InvalidExtensionFunction;
+
+        // Convert the usize to a function pointer
+        const ptr: *anyopaque = @ptrFromInt(fn_pointer);
+        const cast_fn: LPFN_WSARECVMSG = @ptrCast(ptr);
+
+        // We can't check if cast_fn is null since it's not an optional pointer
+        // Just return the function pointer
+        return cast_fn;
+    }
+
+    pub fn recvmsg(skt: *Socket, data: []u8, flags: u32) !RecvMsgResult {
+        const recvmsg_fn = try locateWsaRecvMsg(skt.internal);
+
+        // Prepare address storage for the sender
+        var addr_storage: std.posix.sockaddr.storage = undefined;
+        const addr_len: i32 = @sizeOf(@TypeOf(addr_storage));
+
+        // Prepare control message buffer based on socket family
+        var control_buffer: [256]u8 = undefined;
+
+        // Create the WSA buffer for data
+        var wsa_buf = WSABUF{
+            .len = @intCast(data.len),
+            .buf = data.ptr,
+        };
+
+        // Create the WSA message structure
+        var wsa_msg = WSAMSG{
+            .name = @ptrCast(&addr_storage),
+            .namelen = addr_len,
+            .lpBuffers = @ptrCast(&wsa_buf),
+            .dwBufferCount = 1,
+            .Control = WSABUF{
+                .len = @intCast(control_buffer.len),
+                .buf = &control_buffer,
+            },
+            .dwFlags = @intCast(flags),
+        };
+
+        // Call WSARecvMsg
+        var bytes_received: u32 = 0;
+        const result = recvmsg_fn(
+            skt.internal,
+            &wsa_msg,
+            &bytes_received,
+            null,
+            null,
+        );
+
+        if (result != 0) {
+            const err = windows.ws2_32.WSAGetLastError();
+            switch (err) {
+                .WSAEMSGSIZE => return error.MessageTooBig,
+                .WSAEWOULDBLOCK => return error.WouldBlock,
+                .WSAEFAULT => unreachable,
+                .WSAEINVAL => unreachable,
+                .WSAEINTR => return error.Interrupted,
+                .WSAETIMEDOUT => return error.ConnectionTimedOut,
+                else => return error.NetworkSubsystemFailed,
+            }
+        }
+
+        if (bytes_received == 0) {
+            return error.ConnectionClosed;
+        }
+
+        // Process control messages to extract packet info
+        var pkt_info: PktInfo = undefined;
+        var pkt_info_found = false;
+
+        // Get source address from the sender
+        const src_addr = try EndPoint.fromSocketAddress(@ptrCast(wsa_msg.name), @intCast(wsa_msg.namelen));
+        pkt_info.addr_src = EndPoint{
+            .address = src_addr.address,
+            .port = src_addr.port,
+        };
+
+        // Process control messages to extract destination address and interface
+        var cmsg_ptr: [*]u8 = &control_buffer;
+        var control_len = wsa_msg.Control.len;
+
+        while (control_len >= @sizeOf(CMSGHDR)) {
+            const cmsg: *CMSGHDR = @ptrCast(@alignCast(cmsg_ptr));
+
+            if (cmsg.cmsg_len < @sizeOf(CMSGHDR)) {
+                break;
+            }
+
+            if (skt.family == .ipv4 and
+                cmsg.cmsg_level == ws2_32.IPPROTO.IP and
+                cmsg.cmsg_type == IP_PKTINFO)
+            {
+                if (cmsg.cmsg_len >= @sizeOf(CMSGHDR) + @sizeOf(IN_PKTINFO)) {
+                    const info: *IN_PKTINFO = @ptrCast(@alignCast(cmsg_ptr + @sizeOf(CMSGHDR)));
+
+                    pkt_info.if_index = info.ipi_ifindex;
+                    pkt_info.addr_dst = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr_s_addr) } };
+
+                    pkt_info_found = true;
+                }
+            } else if (skt.family == .ipv6 and
+                cmsg.cmsg_level == ws2_32.IPPROTO.IP and
+                cmsg.cmsg_type == IPV6_PKTINFO)
+            {
+                if (cmsg.cmsg_len >= @sizeOf(CMSGHDR) + @sizeOf(IN6_PKTINFO)) {
+                    const info: *IN6_PKTINFO = @ptrCast(@alignCast(cmsg_ptr + @sizeOf(CMSGHDR)));
+
+                    pkt_info.if_index = info.ipi6_ifindex;
+                    pkt_info.addr_dst = Address{
+                        .ipv6 = .{
+                            .value = info.ipi6_addr,
+                            .scope_id = 0,
+                        },
+                    };
+
+                    pkt_info_found = true;
+                }
+            }
+
+            // Move to next control message
+            const next_offset = std.mem.alignForward(usize, cmsg.cmsg_len, 8); // Align to 8 bytes
+            cmsg_ptr += next_offset;
+            if (control_len < next_offset) {
+                break;
+            }
+            control_len -= @intCast(next_offset);
+        }
+
+        if (!pkt_info_found) {
+            return error.NoPktInfo;
+        }
+
+        return RecvMsgResult{
+            .pkt_info = pkt_info,
+            .bytes_received = bytes_received,
+        };
+    }
+
+    pub fn joinMulticastGroup(self: std.posix.socket_t, group: Socket.MulticastGroup) !void {
+        // https://learn.microsoft.com/en-us/windows/win32/winsock/multicast-programming-sample
+        // https://learn.microsoft.com/en-us/windows/win32/api/ws2ipdef/ns-ws2ipdef-ip_mreq_source
+        // https://learn.microsoft.com/en-us/windows/win32/api/ws2ipdef/ns-ws2ipdef-ip_mreq
+        //
+        // Note that `IP_ADD_MEMBERSHIP` is from `IGMPv2` to receive any multicast
+        // without specifying the source address.
+        // `IP_ADD_SOURCE_MEMBERSHIP` is from `IGMPv3` to receive multicast from a specific source.
+        const request = ip_mreq{
+            .imr_multiaddr = IN_ADDR{ .s_addr = @bitCast(group.group.value) },
+            .imr_interface = IN_ADDR{ .s_addr = @bitCast(group.interface.value) },
+        };
+
+        try std.posix.setsockopt(
+            self,
+            std.os.windows.ws2_32.IPPROTO.IP,
+            std.os.windows.ws2_32.IP_ADD_MEMBERSHIP,
+            std.mem.asBytes(&request),
+        );
+        return;
+    }
 };
 
 // ************* recvmsg *************
-
-const in_addr = extern struct {
-    s_addr: u32,
-};
-
-const in_pktinfo = extern struct {
-    ipi_ifindex: u32,
-    ipi_spec_dst: in_addr,
-    ipi_addr: in_addr,
-};
-
-// IPv6 packet info structure
-const in6_addr = extern struct {
-    s6_addr: [16]u8,
-};
-
-const in6_pktinfo = extern struct {
-    ipi6_addr: in6_addr,
-    ipi6_ifindex: u32,
-};
 
 // https://github.com/pixsper/socket-pktinfo
 // https://github.com/pixsper/socket-pktinfo/blob/main/src/unix.rs
@@ -1677,6 +1889,25 @@ const in6_pktinfo = extern struct {
 
 const iovec = std.posix.iovec;
 const msghdr = std.posix.msghdr;
+const in_addr = extern struct {
+    s_addr: u32,
+};
+
+const in_pktinfo = extern struct {
+    ipi_ifindex: u32,
+    ipi_spec_dst: in_addr,
+    ipi_addr: in_addr,
+};
+
+// IPv6 packet info structure
+const in6_addr = extern struct {
+    s6_addr: [16]u8,
+};
+
+const in6_pktinfo = extern struct {
+    ipi6_addr: in6_addr,
+    ipi6_ifindex: u32,
+};
 
 const unix = struct {
     // there's no `recvmsg` in `bsd` predefined in `std.posix`
@@ -1685,7 +1916,7 @@ const unix = struct {
     // note that std.c is for `solaris` and `illumos`
 
     fn CMSG_HDR_TYPE() type {
-        return if (is_bsd) {
+        return if (comptime is_bsd) {
             return extern struct {
                 len: std.posix.socklen_t,
                 level: c_int,
@@ -1693,7 +1924,6 @@ const unix = struct {
             };
         } else {
             // musl implementation
-            // TODO: check if glibc implementation is the same
             return if (@sizeOf(usize) > 4)
                 if (builtin.target.cpu.arch.endian() == .big)
                     extern struct {
@@ -1778,8 +2008,6 @@ const unix = struct {
     }
 };
 
-const bsd = struct {};
-
 pub const PktInfo = struct {
     // network interface index
     if_index: u64,
@@ -1795,6 +2023,7 @@ const RecvMsgError = std.posix.RecvFromError || error{
     ExtensionFunctionNotFound,
     InvalidExtensionFunction,
     ConnectionClosed,
+    ControlBufferTooLarge,
 };
 const SetSockOptError = std.posix.SetSockOptError || error{
     UnsupportedAddressFamily,
@@ -1812,14 +2041,14 @@ pub fn recvmsgSetSocketOpt(sock: *Socket) SetSockOptError!void {
             try std.posix.setsockopt(
                 sock.internal,
                 std.os.windows.ws2_32.IPPROTO.IP,
-                win.IP_PKTINFO,
+                windows.IP_PKTINFO,
                 std.mem.asBytes(&on),
             );
         } else if (sock.family == .ipv6) {
             try std.posix.setsockopt(
                 sock.internal,
                 std.os.windows.ws2_32.IPPROTO.IP,
-                win.IPV6_PKTINFO,
+                windows.IPV6_PKTINFO,
                 std.mem.asBytes(&on),
             );
         }
@@ -1852,16 +2081,16 @@ pub fn recvmsgSetSocketOpt(sock: *Socket) SetSockOptError!void {
     }
 }
 
-// Return type that includes both packet info and bytes received
 pub fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult {
     if (comptime is_windows) {
-        return win.recvmsg(sock, data, flags);
+        return windows.recvmsg(sock, data, flags);
     }
 
     var msg: msghdr = undefined;
     var addr_storage: std.posix.sockaddr.storage = undefined;
     var iov: [1]iovec = undefined;
-    var control_buffer: [256]u8 = undefined;
+    const MAX_CONTROL_BUFFER_SIZE = 256;
+    var control_buffer: [MAX_CONTROL_BUFFER_SIZE]u8 = undefined;
 
     // Set up the message header - use the provided data buffer for payload
     iov[0].base = data.ptr;
@@ -1872,6 +2101,9 @@ pub fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult
     msg.iov = &iov;
     msg.iovlen = 1;
     msg.control = &control_buffer;
+    if (control_buffer.len > MAX_CONTROL_BUFFER_SIZE) {
+        return error.ControlBufferTooLarge;
+    }
     msg.controllen = control_buffer.len;
     msg.flags = 0;
 
@@ -1916,10 +2148,8 @@ pub fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult
     while (cmsg != null) : (cmsg = unix.CMSG_NXTHDR(&msg, cmsg.?)) {
         const hdr = cmsg.?;
 
-        // IP_PKTINFO: 8 on Linux, 26 on BSD
-        const IP_PKTINFO = if (is_linux) 8 else if (is_bsd) 26 else 8;
-        // IPV6_PKTINFO: 50 on Linux, 46 on BSD
-        const IPV6_PKTINFO = if (is_linux) 50 else if (is_bsd) 46 else 50;
+        const IP_PKTINFO = if (is_linux) std.os.linux.IP.PKTINFO else 26;
+        const IPV6_PKTINFO = if (is_linux) std.os.linux.IPV6.PKTINFO else 46;
 
         if (sock.family == .ipv4 and
             hdr.level == std.posix.IPPROTO.IP and
@@ -1943,11 +2173,9 @@ pub fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult
             hdr.level == std.posix.IPPROTO.IPV6 and
             hdr.type == IPV6_PKTINFO)
         {
-            // Handle IPv6 packet info
             const info: *in6_pktinfo = @ptrCast(@alignCast(unix.CMSG_DATA(hdr)));
             pkt_info.if_index = info.ipi6_ifindex;
 
-            // Source address (where the packet came from)
             const src_addr = try EndPoint.fromSocketAddress(@ptrCast(msg.name), msg.namelen);
             const dst_addr = Address{ .ipv6 = .{ .value = info.ipi6_addr.s6_addr, .scope_id = 0 } };
             pkt_info.addr_dst = dst_addr;
@@ -1968,7 +2196,7 @@ pub fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult
 
     return RecvMsgResult{
         .pkt_info = pkt_info,
-        .bytes_received = @intCast(bytes_recv),
+        .bytes_received = bytes_recv,
     };
 }
 
@@ -2036,257 +2264,23 @@ test "CMSG macros" {
     }
 }
 
-const win = struct {
-    // Control message buffer sizes
-    const CMSG_HEADER_SIZE: usize = @sizeOf(CMSGHDR);
-    const PKTINFOV4_DATA_SIZE: usize = @sizeOf(IN_PKTINFO);
-    const PKTINFOV6_DATA_SIZE: usize = @sizeOf(IN6_PKTINFO);
-    const CONTROL_PKTINFOV4_BUFFER_SIZE: usize = CMSG_HEADER_SIZE + PKTINFOV4_DATA_SIZE;
-    const CONTROL_PKTINFOV6_BUFFER_SIZE: usize = CMSG_HEADER_SIZE + PKTINFOV6_DATA_SIZE + 8; // Add padding
-
-    // Windows-specific structures
-    // These structures aren't available in std.os.windows.ws2_32
-    // Based on Windows SDK headers and the rust-lang/socket-pktinfo implementation
-    const CMSGHDR = extern struct {
-        cmsg_len: usize,
-        cmsg_level: i32,
-        cmsg_type: i32,
-    };
-
-    // Use a flat structure for IN_PKTINFO to make it extern-compatible
-    const IN_PKTINFO = extern struct {
-        ipi_addr_s_addr: u32, // Equivalent to S_un.S_addr
-        ipi_ifindex: u32,
-    };
-
-    // Use a flat structure for IN6_PKTINFO to make it extern-compatible
-    const IN6_PKTINFO = extern struct {
-        ipi6_addr: [16]u8, // Equivalent to u.Byte
-        ipi6_ifindex: u32,
-    };
-
-    const IN_ADDR = extern struct {
-        s_addr: u32,
-    };
-
-    const ip_mreq = extern struct {
-        imr_multiaddr: IN_ADDR,
-        imr_interface: IN_ADDR,
-    };
-
-    // Use standard library definitions where available
-    const WSABUF = std.os.windows.ws2_32.WSABUF;
-    const WSAMSG = std.os.windows.ws2_32.WSAMSG;
-
-    // Socket option constants from standard library
-    const IP_PKTINFO: i32 = std.os.windows.ws2_32.IP_PKTINFO;
-    const IPV6_PKTINFO: i32 = std.os.windows.ws2_32.IPV6_PKTINFO;
-    const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = std.os.windows.ws2_32.SIO_GET_EXTENSION_FUNCTION_POINTER;
-
-    // Extensions function ID
-    const LPFN_WSARECVMSG = std.os.windows.ws2_32.LPFN_WSARECVMSG;
-    const WSAID_WSARECVMSG = std.os.windows.ws2_32.WSAID_WSARECVMSG;
-
-    /// Locate the WSARecvMsg extension function
-    fn locateWsaRecvMsg(socket: std.posix.socket_t) !LPFN_WSARECVMSG {
-        var fn_pointer: usize = 0;
-        var byte_len: u32 = 0;
-
-        // Get the function pointer using WSAIoctl
-        const r = windows.ws2_32.WSAIoctl(
-            socket,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            @constCast(@ptrCast(&WSAID_WSARECVMSG)),
-            @sizeOf(@TypeOf(WSAID_WSARECVMSG)),
-            @ptrCast(&fn_pointer),
-            @sizeOf(@TypeOf(fn_pointer)),
-            &byte_len,
-            null,
-            null,
-        );
-
-        if (r != 0) return error.ExtensionFunctionNotFound;
-
-        if (@sizeOf(usize) != byte_len)
-            return error.InvalidExtensionFunction;
-
-        // Convert the usize to a function pointer
-        const ptr: *anyopaque = @ptrFromInt(fn_pointer);
-        const cast_fn: LPFN_WSARECVMSG = @ptrCast(ptr);
-
-        // We can't check if cast_fn is null since it's not an optional pointer
-        // Just return the function pointer
-        return cast_fn;
-    }
-
-    pub fn recvmsg(socket: *Socket, data: []u8, flags: u32) !RecvMsgResult {
-        const recvmsg_fn = try win.locateWsaRecvMsg(socket.internal);
-
-        // Prepare address storage for the sender
-        var addr_storage: std.posix.sockaddr.storage = undefined;
-        const addr_len: i32 = @sizeOf(@TypeOf(addr_storage));
-
-        // Prepare control message buffer based on socket family
-        var control_buffer: [256]u8 = undefined;
-
-        // Create the WSA buffer for data
-        var wsa_buf = win.WSABUF{
-            .len = @intCast(data.len),
-            .buf = data.ptr,
-        };
-
-        // Create the WSA message structure
-        var wsa_msg = win.WSAMSG{
-            .name = @ptrCast(&addr_storage),
-            .namelen = addr_len,
-            .lpBuffers = @ptrCast(&wsa_buf),
-            .dwBufferCount = 1,
-            .Control = win.WSABUF{
-                .len = @intCast(control_buffer.len),
-                .buf = &control_buffer,
-            },
-            .dwFlags = @intCast(flags),
-        };
-
-        // Call WSARecvMsg
-        var bytes_received: u32 = 0;
-        const result = recvmsg_fn(
-            socket.internal,
-            &wsa_msg,
-            &bytes_received,
-            null,
-            null,
-        );
-
-        if (result != 0) {
-            const err = windows.ws2_32.WSAGetLastError();
-            switch (err) {
-                .WSAEMSGSIZE => return error.MessageTooBig,
-                .WSAEWOULDBLOCK => return error.WouldBlock,
-                .WSAEFAULT => unreachable,
-                .WSAEINVAL => unreachable,
-                .WSAEINTR => return error.Interrupted,
-                .WSAETIMEDOUT => return error.ConnectionTimedOut,
-                else => return error.NetworkSubsystemFailed,
-            }
-        }
-
-        if (bytes_received == 0) {
-            return error.ConnectionClosed;
-        }
-
-        // Process control messages to extract packet info
-        var pkt_info: PktInfo = undefined;
-        var pkt_info_found = false;
-
-        // Get source address from the sender
-        const src_addr = try EndPoint.fromSocketAddress(@ptrCast(wsa_msg.name), @intCast(wsa_msg.namelen));
-        pkt_info.addr_src = EndPoint{
-            .address = src_addr.address,
-            .port = src_addr.port,
-        };
-
-        // Process control messages to extract destination address and interface
-        var cmsg_ptr: [*]u8 = &control_buffer;
-        var control_len = wsa_msg.Control.len;
-
-        while (control_len >= @sizeOf(win.CMSGHDR)) {
-            const cmsg: *win.CMSGHDR = @ptrCast(@alignCast(cmsg_ptr));
-
-            if (cmsg.cmsg_len < @sizeOf(win.CMSGHDR)) {
-                break;
-            }
-
-            if (socket.family == .ipv4 and
-                cmsg.cmsg_level == std.os.windows.ws2_32.IPPROTO.IP and
-                cmsg.cmsg_type == win.IP_PKTINFO)
-            {
-                if (cmsg.cmsg_len >= @sizeOf(win.CMSGHDR) + @sizeOf(win.IN_PKTINFO)) {
-                    const info: *win.IN_PKTINFO = @ptrCast(@alignCast(cmsg_ptr + @sizeOf(win.CMSGHDR)));
-
-                    pkt_info.if_index = info.ipi_ifindex;
-                    pkt_info.addr_dst = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr_s_addr) } };
-
-                    pkt_info_found = true;
-                }
-            } else if (socket.family == .ipv6 and
-                cmsg.cmsg_level == std.os.windows.ws2_32.IPPROTO.IP and
-                cmsg.cmsg_type == win.IPV6_PKTINFO)
-            {
-                if (cmsg.cmsg_len >= @sizeOf(win.CMSGHDR) + @sizeOf(win.IN6_PKTINFO)) {
-                    const info: *win.IN6_PKTINFO = @ptrCast(@alignCast(cmsg_ptr + @sizeOf(win.CMSGHDR)));
-
-                    pkt_info.if_index = info.ipi6_ifindex;
-                    pkt_info.addr_dst = Address{
-                        .ipv6 = .{
-                            .value = info.ipi6_addr,
-                            .scope_id = 0,
-                        },
-                    };
-
-                    pkt_info_found = true;
-                }
-            }
-
-            // Move to next control message
-            const next_offset = std.mem.alignForward(usize, cmsg.cmsg_len, 8); // Align to 8 bytes
-            cmsg_ptr += next_offset;
-            if (control_len < next_offset) {
-                break;
-            }
-            control_len -= @intCast(next_offset);
-        }
-
-        if (!pkt_info_found) {
-            return error.NoPktInfo;
-        }
-
-        return RecvMsgResult{
-            .pkt_info = pkt_info,
-            .bytes_received = bytes_received,
-        };
-    }
-
-    pub fn joinMulticastGroup(self: std.posix.socket_t, group: Socket.MulticastGroup) !void {
-        // https://learn.microsoft.com/en-us/windows/win32/winsock/multicast-programming-sample
-        // https://learn.microsoft.com/en-us/windows/win32/api/ws2ipdef/ns-ws2ipdef-ip_mreq_source
-        // https://learn.microsoft.com/en-us/windows/win32/api/ws2ipdef/ns-ws2ipdef-ip_mreq
-        //
-        // Note that `IP_ADD_MEMBERSHIP` is from `IGMPv2` to receive any multicast
-        // without specifying the source address.
-        // `IP_ADD_SOURCE_MEMBERSHIP` is from `IGMPv3` to receive multicast from a specific source.
-        const request = ip_mreq{
-            .imr_multiaddr = IN_ADDR{ .s_addr = @bitCast(group.group.value) },
-            .imr_interface = IN_ADDR{ .s_addr = @bitCast(group.interface.value) },
-        };
-
-        try std.posix.setsockopt(
-            self,
-            std.os.windows.ws2_32.IPPROTO.IP,
-            std.os.windows.ws2_32.IP_ADD_MEMBERSHIP,
-            std.mem.asBytes(&request),
-        );
-        return;
-    }
-};
-
 test "Windows CMSG structures" {
     if (!is_windows) return;
 
     const testing = std.testing;
 
     // Test the size of control message buffer
-    try testing.expectEqual(@sizeOf(win.CMSGHDR), win.CMSG_HEADER_SIZE);
+    try testing.expectEqual(@sizeOf(windows.CMSGHDR), windows.CMSG_HEADER_SIZE);
 
     // Test buffer sizes
-    const pktinfov4_buffer_size = win.CONTROL_PKTINFOV4_BUFFER_SIZE;
-    try testing.expect(pktinfov4_buffer_size >= @sizeOf(win.CMSGHDR) + @sizeOf(win.IN_PKTINFO));
+    const pktinfov4_buffer_size = windows.CONTROL_PKTINFOV4_BUFFER_SIZE;
+    try testing.expect(pktinfov4_buffer_size >= @sizeOf(windows.CMSGHDR) + @sizeOf(windows.IN_PKTINFO));
 
-    const pktinfov6_buffer_size = win.CONTROL_PKTINFOV6_BUFFER_SIZE;
-    try testing.expect(pktinfov6_buffer_size >= @sizeOf(win.CMSGHDR) + @sizeOf(win.IN6_PKTINFO));
+    const pktinfov6_buffer_size = windows.CONTROL_PKTINFOV6_BUFFER_SIZE;
+    try testing.expect(pktinfov6_buffer_size >= @sizeOf(windows.CMSGHDR) + @sizeOf(windows.IN6_PKTINFO));
 
     // Create a fake IPv4 packet info for testing
-    const ipv4_pktinfo = win.IN_PKTINFO{
+    const ipv4_pktinfo = windows.IN_PKTINFO{
         .ipi_addr_s_addr = 0x0100007F, // 127.0.0.1
         .ipi_ifindex = 1,
     };
@@ -2295,7 +2289,7 @@ test "Windows CMSG structures" {
     try testing.expectEqual(@as(u32, 1), ipv4_pktinfo.ipi_ifindex);
 
     // Create a fake IPv6 packet info for testing
-    const ipv6_pktinfo = win.IN6_PKTINFO{
+    const ipv6_pktinfo = windows.IN6_PKTINFO{
         .ipi6_addr = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, // ::1
         .ipi6_ifindex = 1,
     };
