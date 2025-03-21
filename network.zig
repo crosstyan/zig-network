@@ -976,12 +976,142 @@ const OSLogic = switch (builtin.os.tag) {
     .windows => WindowsOSLogic,
     .linux => LinuxOSLogic,
     .macos, .ios, .watchos, .tvos => DarwinOsLogic,
-    else => @compileError("unsupported os " ++ @tagName(builtin.os.tag) ++ " for SocketSet!"),
+    else => if (is_bsd) UnixOSLogic else @compileError("unsupported os " ++ @tagName(builtin.os.tag) ++ " for SocketSet!"),
 };
 
-// Linux uses `poll()` syscall to wait for socket events.
-// This allows an arbitrary number of sockets to be handled.
+// Linux uses `epoll()` syscall to wait for socket events.
+// which is more efficient than `poll()`
 const LinuxOSLogic = struct {
+    const Self = @This();
+
+    epoll_fd: i32,
+    events: std.ArrayList(std.os.linux.epoll_event),
+    socket_map: std.AutoHashMap(i32, SocketEvent),
+    allocator: std.mem.Allocator,
+
+    inline fn init(allocator: std.mem.Allocator) !Self {
+        const fd = std.os.linux.epoll_create1(0);
+
+        // negative value
+        if (fd > std.math.maxInt(i32)) {
+            const errno = std.os.linux.E.init(fd);
+            // TODO: convert to error set
+            return std.posix.unexpectedErrno(errno);
+        }
+
+        const epoll_fd: i32 = @intCast(fd);
+        errdefer std.posix.close(epoll_fd);
+
+        return Self{
+            .epoll_fd = epoll_fd,
+            .events = try std.ArrayList(std.os.linux.epoll_event).initCapacity(allocator, 16),
+            .socket_map = std.AutoHashMap(i32, SocketEvent).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    inline fn deinit(self: *Self) void {
+        self.events.deinit();
+        self.socket_map.deinit();
+        std.posix.close(self.epoll_fd);
+    }
+
+    inline fn clear(self: *Self) void {
+        var it = self.socket_map.iterator();
+        while (it.next()) |entry| {
+            _ = std.os.linux.epoll_ctl(
+                self.epoll_fd,
+                std.os.linux.EPOLL.CTL_DEL,
+                entry.key_ptr.*,
+                null,
+            ) catch {};
+        }
+        self.socket_map.clearRetainingCapacity();
+        self.events.clearRetainingCapacity();
+    }
+
+    inline fn add(self: *Self, sock: Socket, events: SocketEvent) !void {
+        var op: u32 = undefined;
+        if (self.socket_map.contains(sock.internal)) {
+            op = std.os.linux.EPOLL.CTL_MOD;
+        } else {
+            op = std.os.linux.EPOLL.CTL_ADD;
+        }
+
+        var event_mask: u32 = std.os.linux.EPOLL.ERR;
+        if (events.read)
+            event_mask |= std.os.linux.EPOLL.IN;
+        if (events.write)
+            event_mask |= std.os.linux.EPOLL.OUT;
+
+        var ev = std.os.linux.epoll_event{
+            .events = event_mask,
+            .data = .{ .fd = sock.internal },
+        };
+
+        var rc: usize = undefined;
+        rc = std.os.linux.epoll_ctl(
+            self.epoll_fd,
+            op,
+            sock.internal,
+            &ev,
+        );
+
+        // negative value
+        // https://man7.org/linux/man-pages/man2/epoll_ctl.2.html
+        if (rc > std.math.maxInt(i32)) {
+            const errno = std.os.linux.E.init(rc);
+            // TODO: convert to error set
+            return std.posix.unexpectedErrno(errno);
+        }
+
+        try self.socket_map.put(sock.internal, events);
+    }
+
+    inline fn remove(self: *Self, sock: Socket) void {
+        if (self.socket_map.contains(sock.internal)) {
+            // TODO: error handling
+            _ = std.os.linux.epoll_ctl(
+                self.epoll_fd,
+                std.os.linux.EPOLL.CTL_DEL,
+                sock.internal,
+                null,
+            );
+            _ = self.socket_map.remove(sock.internal);
+        }
+    }
+
+    inline fn isReadyRead(self: Self, sock: Socket) bool {
+        for (self.events.items) |ev| {
+            if (ev.data.fd == sock.internal) {
+                return (ev.events & std.os.linux.EPOLL.IN) != 0;
+            }
+        }
+        return false;
+    }
+
+    inline fn isReadyWrite(self: Self, sock: Socket) bool {
+        for (self.events.items) |ev| {
+            if (ev.data.fd == sock.internal) {
+                return (ev.events & std.os.linux.EPOLL.OUT) != 0;
+            }
+        }
+        return false;
+    }
+
+    inline fn isFaulted(self: Self, sock: Socket) bool {
+        for (self.events.items) |ev| {
+            if (ev.data.fd == sock.internal) {
+                return (ev.events & std.os.linux.EPOLL.ERR) != 0;
+            }
+        }
+        return false;
+    }
+};
+
+// Unix uses `poll()` syscall to wait for socket events.
+// This allows an arbitrary number of sockets to be handled.
+const UnixOSLogic = struct {
     const Self = @This();
     // use poll on linux
 
@@ -1062,8 +1192,8 @@ const LinuxOSLogic = struct {
     }
 };
 
-/// Alias to LinuxOSLogic as the logic between the two are shared and both support poll()
-const DarwinOsLogic = LinuxOSLogic;
+/// Alias to UnixOSLogic as the logic between the two are shared and both support poll()
+const DarwinOsLogic = UnixOSLogic;
 
 // On windows, we use select()
 const WindowsOSLogic = struct {
@@ -1286,11 +1416,42 @@ pub fn waitForSocketEvent(set: *SocketSet, timeout: ?u64) !usize {
             // Windows ignores first argument.
             return try windows.select(0, read_set, write_set, except_set, if (timeout != null) &tm else null);
         },
-        .linux, .macos, .ios, .watchos, .tvos => return try std.posix.poll(
-            set.internal.fds.items,
-            if (timeout) |val| @as(i32, @intCast((val + std.time.ns_per_ms - 1) / std.time.ns_per_ms)) else -1,
-        ),
-        else => @compileError("unsupported os " ++ @tagName(builtin.os.tag) ++ " for SocketSet!"),
+        .linux => {
+            // Use epoll for Linux
+            set.internal.events.clearRetainingCapacity();
+            const timeout_ms: i32 = if (timeout) |tout|
+                @as(i32, @intCast((tout + std.time.ns_per_ms - 1) / std.time.ns_per_ms))
+            else
+                -1;
+
+            // Resize events array to fit all registered sockets
+            try set.internal.events.resize(set.internal.socket_map.count());
+
+            if (set.internal.events.items.len == 0) return 0;
+
+            var rc: usize = undefined;
+            rc = std.os.linux.epoll_wait(set.internal.epoll_fd, set.internal.events.items.ptr, @intCast(set.internal.events.items.len), timeout_ms);
+
+            if (rc > std.math.maxInt(i32)) {
+                const errno = std.os.linux.E.init(rc);
+                switch (errno) {
+                    .INTR => return 0,
+                    else => return std.posix.unexpectedErrno(errno),
+                }
+            }
+
+            // A return of 0 is valid (timeout with no events)
+            const event_count: usize = @truncate(rc);
+            return event_count;
+        },
+        else => if (is_unix) {
+            return try std.posix.poll(
+                set.internal.fds.items,
+                if (timeout) |val| @as(i32, @intCast((val + std.time.ns_per_ms - 1) / std.time.ns_per_ms)) else -1,
+            );
+        } else {
+            @compileError("unsupported os " ++ @tagName(builtin.os.tag) ++ " for SocketSet!");
+        },
     }
 }
 
