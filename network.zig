@@ -493,6 +493,7 @@ pub const EndPoint = struct {
     }
 };
 
+pub const AcceptError = std.posix.AcceptError || SetSockOptError;
 /// A network socket, can receive and send data for TCP/UDP and accept
 /// incoming connections if bound as a TCP server.
 pub const Socket = struct {
@@ -667,11 +668,12 @@ pub const Socket = struct {
 
     /// Waits until a new TCP client connects to this socket and accepts the incoming TCP connection.
     /// This function is only allowed for a bound TCP socket. `listen()` must have been called before!
-    pub fn accept(self: Self) !Socket {
+    pub fn accept(self: Self) AcceptError!Socket {
         var addr: std.posix.sockaddr.in6 = undefined;
         var addr_size: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in6);
 
-        const flags = 0;
+        // Add SOCK_NONBLOCK flag for Unix systems to make accepted sockets non-blocking
+        const flags = if (is_unix) std.posix.SOCK.NONBLOCK else 0;
 
         const addr_ptr: *std.posix.sockaddr = @ptrCast(&addr);
         const fd = try std.posix.accept(self.internal, addr_ptr, &addr_size, flags);
