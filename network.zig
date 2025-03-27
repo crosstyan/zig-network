@@ -355,14 +355,14 @@ pub const AddressFamily = enum {
     ipv4,
     ipv6,
 
-    fn toNativeAddressFamily(af: Self) u32 {
+    pub fn toNativeAddressFamily(af: Self) u32 {
         return switch (af) {
             .ipv4 => std.posix.AF.INET,
             .ipv6 => std.posix.AF.INET6,
         };
     }
 
-    fn fromNativeAddressFamily(af: i32) !Self {
+    pub fn fromNativeAddressFamily(af: i32) AddressFamilyError!Self {
         return switch (af) {
             std.posix.AF.INET => .ipv4,
             std.posix.AF.INET6 => .ipv6,
@@ -493,7 +493,7 @@ pub const EndPoint = struct {
     }
 };
 
-pub const AcceptError = std.posix.AcceptError || SetSockOptError;
+pub const AcceptError = std.posix.AcceptError || AddressFamilyError;
 /// A network socket, can receive and send data for TCP/UDP and accept
 /// incoming connections if bound as a TCP server.
 pub const Socket = struct {
@@ -2178,6 +2178,10 @@ pub const PktInfo = struct {
     addr_dst: Address, // equivalent `std::net::SocketAddr` in Rust
 };
 
+const AddressFamilyError = error{
+    UnsupportedAddressFamily,
+};
+
 const RecvMsgError = std.posix.RecvFromError || error{
     NoPktInfo,
     Interrupted,
@@ -2188,9 +2192,7 @@ const RecvMsgError = std.posix.RecvFromError || error{
     ConnectionClosed,
     ControlBufferTooLarge,
 };
-const SetSockOptError = std.posix.SetSockOptError || error{
-    UnsupportedAddressFamily,
-};
+const SetSockOptError = std.posix.SetSockOptError || AddressFamilyError;
 
 pub const RecvMsgResult = struct {
     pkt_info: PktInfo,
