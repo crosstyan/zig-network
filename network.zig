@@ -355,14 +355,14 @@ pub const AddressFamily = enum {
     ipv4,
     ipv6,
 
-    fn toNativeAddressFamily(af: Self) u32 {
+    pub fn toNativeAddressFamily(af: Self) u32 {
         return switch (af) {
             .ipv4 => std.posix.AF.INET,
             .ipv6 => std.posix.AF.INET6,
         };
     }
 
-    fn fromNativeAddressFamily(af: i32) !Self {
+    pub fn fromNativeAddressFamily(af: i32) AddressFamilyError!Self {
         return switch (af) {
             std.posix.AF.INET => .ipv4,
             std.posix.AF.INET6 => .ipv6,
@@ -493,7 +493,7 @@ pub const EndPoint = struct {
     }
 };
 
-pub const AcceptError = std.posix.AcceptError || SetSockOptError;
+pub const AcceptError = std.posix.AcceptError || AddressFamilyError;
 /// A network socket, can receive and send data for TCP/UDP and accept
 /// incoming connections if bound as a TCP server.
 pub const Socket = struct {
@@ -792,7 +792,7 @@ pub const Socket = struct {
                 // connection-mode socket was connected already but a recipient was specified
                 // sendto using NULL destination address
                 .ISCONN => return std.posix.sendto(sockfd, buf, flags, null, 0),
-                .MSGSIZE => return error.MessageTooBig,
+                .MSGSIZE => return error.MessageTooLong,
                 .NOBUFS => return error.SystemResources,
                 .NOMEM => return error.SystemResources,
                 .NOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
@@ -883,7 +883,7 @@ pub const Socket = struct {
         const IP_ADD_MEMBERSHIP_BSD = 12;
         const IP_ADD_MEMBERSHIP_LINUX = std.os.linux.IP.ADD_MEMBERSHIP;
         const IP_ADD_MEMBERSHIP = if (is_bsd) IP_ADD_MEMBERSHIP_BSD else IP_ADD_MEMBERSHIP_LINUX;
-        const level = if (is_bsd) std.posix.IPPROTO.IP else std.posix.SOL.SOCKET;
+        const level = std.posix.IPPROTO.IP;
 
         try std.posix.setsockopt(
             self.internal,
@@ -1906,7 +1906,7 @@ const windows = struct {
         if (result != 0) {
             const err = windows.ws2_32.WSAGetLastError();
             switch (err) {
-                .WSAEMSGSIZE => return error.MessageTooBig,
+                .WSAEMSGSIZE => return error.MessageTooLong,
                 .WSAEWOULDBLOCK => return error.WouldBlock,
                 .WSAEFAULT => unreachable,
                 .WSAEINVAL => unreachable,
@@ -1987,7 +1987,7 @@ const windows = struct {
         }
 
         return RecvMsgResult{
-            .pkt_info = pkt_info,
+            .info = pkt_info,
             .bytes_received = bytes_received,
         };
     }
@@ -2050,29 +2050,27 @@ const windows = struct {
 // macOS
 // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/any-macos-any/sys/socket.h#L600-L611
 
-const iovec = std.posix.iovec;
-const msghdr = std.posix.msghdr;
-const in_addr = extern struct {
-    s_addr: u32,
-};
-
-const in_pktinfo = extern struct {
-    ipi_ifindex: u32,
-    ipi_spec_dst: in_addr,
-    ipi_addr: in_addr,
-};
-
-// IPv6 packet info structure
-const in6_addr = extern struct {
-    s6_addr: [16]u8,
-};
-
-const in6_pktinfo = extern struct {
-    ipi6_addr: in6_addr,
-    ipi6_ifindex: u32,
-};
-
 const unix = struct {
+    const iovec = std.posix.iovec;
+    // Use linux.msghdr directly like mini.zig does
+    const msghdr = std.posix.msghdr;
+
+    const in_addr = extern struct {
+        s_addr: u32,
+    };
+    const in_pktinfo = extern struct {
+        ipi_ifindex: u32,
+        ipi_spec_dst: in_addr,
+        ipi_addr: in_addr,
+    };
+
+    const in6_addr = extern struct {
+        s6_addr: [16]u8,
+    };
+    const in6_pktinfo = extern struct {
+        ipi6_addr: in6_addr,
+        ipi6_ifindex: u32,
+    };
     // there's no `recvmsg` in `bsd` predefined in `std.posix`
     // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/any-macos-any/sys/socket.h#L600-L611
     // I bet the `recvmsg` implementation in `bsd` is the same as `linux`
@@ -2112,10 +2110,7 @@ const unix = struct {
     }
 
     const cmsghdr = CMSG_HDR_TYPE();
-    const recvmsg = std.posix.linux.recvmsg;
 
-    // CMSG macros implementation in Zig
-    // Based on musl implementation which is more robust
     fn CMSG_ALIGN(len: usize) usize {
         return std.mem.alignForward(usize, len, @sizeOf(usize));
     }
@@ -2134,7 +2129,6 @@ const unix = struct {
     }
 
     fn __CMSG_LEN(cmsg: *const cmsghdr) usize {
-        // (len + @sizeOf(usize) - 1) & ~(@as(usize, @sizeOf(usize) - 1))
         return std.mem.alignForward(usize, cmsg.len, @sizeOf(usize));
     }
 
@@ -2169,13 +2163,144 @@ const unix = struct {
 
         return @ptrCast(@alignCast(next));
     }
+
+    pub fn recvmsg(sock: *Socket, buffer: []u8, flags: u32) RecvMsgError!RecvMsgResult {
+        const MAX_CONTROL_BUFFER_SIZE = @sizeOf(cmsghdr) + 1024;
+        var cmsg_buf: [MAX_CONTROL_BUFFER_SIZE]u8 = undefined;
+        var src_addr: std.posix.sockaddr.storage = undefined;
+        var iov = iovec{
+            .base = buffer.ptr,
+            .len = buffer.len,
+        };
+
+        var msg = msghdr{
+            .name = @ptrCast(&src_addr),
+            .namelen = @sizeOf(std.posix.sockaddr.storage),
+            .iov = @ptrCast(&iov),
+            .iovlen = 1,
+            .control = &cmsg_buf,
+            .controllen = cmsg_buf.len,
+            .flags = 0,
+        };
+
+        var rc: isize = undefined;
+        if (comptime is_linux) {
+            rc = @bitCast(std.os.linux.recvmsg(sock.internal, &msg, flags));
+        } else if (comptime is_bsd) {
+            rc = std.c.recvmsg(sock.internal, &msg, flags);
+        } else {
+            @compileError("Unsupported OS: " ++ @tagName(builtin.os.tag));
+        }
+        if (rc < 0) {
+            const errno = std.posix.errno(rc);
+            switch (errno) {
+                .BADF => unreachable,
+                .FAULT => unreachable,
+                .INVAL => unreachable,
+                .NOTCONN => return error.SocketNotConnected,
+                .MSGSIZE => return error.MessageTooLong,
+                .NOTSOCK => unreachable,
+                .INTR => return error.Interrupted,
+                .AGAIN => return error.WouldBlock,
+                .NOMEM => return error.SystemResources,
+                .CONNREFUSED => return error.ConnectionRefused,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .TIMEDOUT => return error.ConnectionTimedOut,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
+        }
+        const bytes_recv: usize = @intCast(rc);
+
+        var is_found_pktinfo = false;
+        var pkt_info: PktInfo = undefined;
+
+        var cmsg = unix.CMSG_FIRSTHDR(&msg);
+        const IP_PKTINFO = if (is_linux) std.os.linux.IP.PKTINFO else 26;
+        const IPV6_PKTINFO = if (is_linux) std.os.linux.IPV6.PKTINFO else 46;
+
+        while (cmsg != null) : (cmsg = unix.CMSG_NXTHDR(&msg, cmsg.?)) {
+            const hdr = cmsg.?;
+
+            if (sock.family == .ipv4 and
+                hdr.level == std.posix.IPPROTO.IP and
+                hdr.type == IP_PKTINFO)
+            {
+                const info: *unix.in_pktinfo = @ptrCast(@alignCast(unix.CMSG_DATA(hdr)));
+                pkt_info.if_index = info.ipi_ifindex;
+
+                const src_addr_ep = try EndPoint.fromSocketAddress(@ptrCast(msg.name), msg.namelen);
+                const dst_addr = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr.s_addr) } };
+                pkt_info.addr_dst = dst_addr;
+
+                pkt_info.addr_src = EndPoint{
+                    .address = src_addr_ep.address,
+                    .port = src_addr_ep.port,
+                };
+
+                is_found_pktinfo = true;
+                break;
+            } else if (sock.family == .ipv6 and
+                hdr.level == std.posix.IPPROTO.IPV6 and
+                hdr.type == IPV6_PKTINFO)
+            {
+                const info: *unix.in6_pktinfo = @ptrCast(@alignCast(unix.CMSG_DATA(hdr)));
+                pkt_info.if_index = info.ipi6_ifindex;
+
+                const src_addr_ep = try EndPoint.fromSocketAddress(@ptrCast(msg.name), msg.namelen);
+                const dst_addr = Address{ .ipv6 = .{ .value = info.ipi6_addr.s6_addr, .scope_id = 0 } };
+                pkt_info.addr_dst = dst_addr;
+
+                pkt_info.addr_src = EndPoint{
+                    .address = src_addr_ep.address,
+                    .port = src_addr_ep.port,
+                };
+
+                is_found_pktinfo = true;
+                break;
+            }
+        }
+
+        if (!is_found_pktinfo) {
+            return error.NoPktInfo;
+        }
+        return RecvMsgResult{ .info = pkt_info, .message = buffer[0..bytes_recv] };
+    }
+
+    pub fn setSockOptIpPktInfo(sock: *Socket) SetSockOptError!void {
+        if (sock.family == .ipv4) {
+            const on: c_int = 1;
+            // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/any-macos-any/netinet/in.h#L433-L434
+            const IP_PKTINFO_BSD = 26;
+            const IP_PKTINFO = if (is_linux) std.os.linux.IP.PKTINFO else IP_PKTINFO_BSD;
+            try std.posix.setsockopt(
+                sock.internal,
+                std.posix.IPPROTO.IP,
+                IP_PKTINFO,
+                std.mem.asBytes(&on),
+            );
+        } else if (sock.family == .ipv6) {
+            const on: c_int = 1;
+            // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/any-macos-any/netinet6/in6.h#L456
+            const IPV6_RECVPKTINFO_BSD = 61;
+            const IPV6_RECVPKTINFO = if (is_linux) std.os.linux.IPV6.RECVPKTINFO else IPV6_RECVPKTINFO_BSD;
+            try std.posix.setsockopt(
+                sock.internal,
+                std.posix.IPPROTO.IPV6,
+                IPV6_RECVPKTINFO,
+                std.mem.asBytes(&on),
+            );
+        }
+    }
 };
 
 pub const PktInfo = struct {
-    // network interface index
-    if_index: u64,
+    if_index: u64, // network interface index
     addr_src: EndPoint, // equivalent `std::net::IpAddr` in Rust
     addr_dst: Address, // equivalent `std::net::SocketAddr` in Rust
+};
+
+const AddressFamilyError = error{
+    UnsupportedAddressFamily,
 };
 
 const RecvMsgError = std.posix.RecvFromError || error{
@@ -2186,18 +2311,13 @@ const RecvMsgError = std.posix.RecvFromError || error{
     ExtensionFunctionNotFound,
     InvalidExtensionFunction,
     ConnectionClosed,
-    ControlBufferTooLarge,
+    MessageTooLong,
 };
-const SetSockOptError = std.posix.SetSockOptError || error{
-    UnsupportedAddressFamily,
-};
+const SetSockOptError = std.posix.SetSockOptError || AddressFamilyError;
 
-pub const RecvMsgResult = struct {
-    pkt_info: PktInfo,
-    bytes_received: usize,
-};
+pub const RecvMsgResult = struct { info: PktInfo, message: []const u8 };
 
-pub fn recvmsgSetSocketOpt(sock: *Socket) SetSockOptError!void {
+pub fn setSockOptIpPktInfo(sock: *Socket) SetSockOptError!void {
     if (builtin.os.tag == .windows) {
         const on: c_int = 1;
         if (sock.family == .ipv4) {
@@ -2215,152 +2335,17 @@ pub fn recvmsgSetSocketOpt(sock: *Socket) SetSockOptError!void {
                 std.mem.asBytes(&on),
             );
         }
-        return;
-    }
-
-    // Set socket options to receive packet info
-    if (sock.family == .ipv4) {
-        const on: c_int = 1;
-        // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/any-macos-any/netinet/in.h#L433-L434
-        const IP_PKTINFO_BSD = 26;
-        const IP_PKTINFO = if (is_linux) std.os.linux.IP.PKTINFO else IP_PKTINFO_BSD;
-        try std.posix.setsockopt(
-            sock.internal,
-            std.posix.IPPROTO.IP,
-            IP_PKTINFO,
-            std.mem.asBytes(&on),
-        );
-    } else if (sock.family == .ipv6) {
-        const on: c_int = 1;
-        // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/include/any-macos-any/netinet6/in6.h#L456
-        const IPV6_RECVPKTINFO_BSD = 61;
-        const IPV6_RECVPKTINFO = if (is_linux) std.os.linux.IPV6.RECVPKTINFO else IPV6_RECVPKTINFO_BSD;
-        try std.posix.setsockopt(
-            sock.internal,
-            std.posix.IPPROTO.IPV6,
-            IPV6_RECVPKTINFO,
-            std.mem.asBytes(&on),
-        );
+    } else {
+        return unix.setSockOptIpPktInfo(sock);
     }
 }
 
-pub fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult {
+pub inline fn recvmsg(sock: *Socket, data: []u8, flags: u32) RecvMsgError!RecvMsgResult {
     if (comptime is_windows) {
         return windows.recvmsg(sock, data, flags);
-    }
-
-    var msg: msghdr = undefined;
-    var addr_storage: std.posix.sockaddr.storage = undefined;
-    var iov: [1]iovec = undefined;
-    const MAX_CONTROL_BUFFER_SIZE = 256;
-    var control_buffer: [MAX_CONTROL_BUFFER_SIZE]u8 = undefined;
-
-    // Set up the message header - use the provided data buffer for payload
-    iov[0].base = data.ptr;
-    iov[0].len = data.len;
-
-    msg.name = @ptrCast(&addr_storage);
-    msg.namelen = @sizeOf(std.posix.sockaddr.storage);
-    msg.iov = &iov;
-    msg.iovlen = 1;
-    msg.control = &control_buffer;
-    if (control_buffer.len > MAX_CONTROL_BUFFER_SIZE) {
-        return error.ControlBufferTooLarge;
-    }
-    msg.controllen = control_buffer.len;
-    msg.flags = 0;
-
-    // https://github.com/ziglang/zig/blob/d590b87b6f6d87c5cf58fbc70e3094ece754ec31/lib/libc/musl/src/network/recvmsg.c#L20
-    var is_found_pktinfo = false;
-    var pkt_info: PktInfo = undefined;
-    var ret_val: isize = undefined;
-    if (comptime is_linux) {
-        ret_val = @intCast(std.os.linux.recvmsg(sock.internal, &msg, flags));
-    } else if (comptime is_bsd) {
-        ret_val = std.c.recvmsg(sock.internal, &msg, @intCast(flags));
     } else {
-        @compileError("Unsupported OS: " ++ @tagName(builtin.os.tag));
+        return unix.recvmsg(sock, data, flags);
     }
-    if (ret_val <= 0) {
-        var errno: std.posix.E = undefined;
-        if (comptime is_linux) {
-            errno = std.os.linux.E.init(@intCast(ret_val));
-        } else if (comptime is_bsd) {
-            errno = std.posix.errno(-1);
-        } else {
-            @compileError("Unsupported OS: " ++ @tagName(builtin.os.tag));
-        }
-        switch (errno) {
-            .BADF => unreachable, // always a race condition
-            .FAULT => unreachable,
-            .INVAL => unreachable,
-            .NOTCONN => return error.SocketNotConnected,
-            .NOTSOCK => unreachable,
-            .INTR => return error.Interrupted,
-            .AGAIN => return error.WouldBlock,
-            .NOMEM => return error.SystemResources,
-            .CONNREFUSED => return error.ConnectionRefused,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            .TIMEDOUT => return error.ConnectionTimedOut,
-            else => |err| return std.posix.unexpectedErrno(err),
-        }
-    }
-    const bytes_recv: usize = @intCast(ret_val);
-
-    var cmsg = unix.CMSG_FIRSTHDR(&msg);
-    while (cmsg != null) : (cmsg = unix.CMSG_NXTHDR(&msg, cmsg.?)) {
-        const hdr = cmsg.?;
-
-        const IP_PKTINFO = if (is_linux) std.os.linux.IP.PKTINFO else 26;
-        const IPV6_PKTINFO = if (is_linux) std.os.linux.IPV6.PKTINFO else 46;
-
-        if (sock.family == .ipv4 and
-            hdr.level == std.posix.IPPROTO.IP and
-            hdr.type == IP_PKTINFO)
-        {
-            const info: *in_pktinfo = @ptrCast(@alignCast(unix.CMSG_DATA(hdr)));
-            pkt_info.if_index = info.ipi_ifindex;
-
-            const src_addr = try EndPoint.fromSocketAddress(@ptrCast(msg.name), msg.namelen);
-            const dst_addr = Address{ .ipv4 = .{ .value = @bitCast(info.ipi_addr.s_addr) } };
-            pkt_info.addr_dst = dst_addr;
-
-            pkt_info.addr_src = EndPoint{
-                .address = src_addr.address,
-                .port = src_addr.port,
-            };
-
-            is_found_pktinfo = true;
-            break;
-        } else if (sock.family == .ipv6 and
-            hdr.level == std.posix.IPPROTO.IPV6 and
-            hdr.type == IPV6_PKTINFO)
-        {
-            const info: *in6_pktinfo = @ptrCast(@alignCast(unix.CMSG_DATA(hdr)));
-            pkt_info.if_index = info.ipi6_ifindex;
-
-            const src_addr = try EndPoint.fromSocketAddress(@ptrCast(msg.name), msg.namelen);
-            const dst_addr = Address{ .ipv6 = .{ .value = info.ipi6_addr.s6_addr, .scope_id = 0 } };
-            pkt_info.addr_dst = dst_addr;
-
-            pkt_info.addr_src = EndPoint{
-                .address = src_addr.address,
-                .port = src_addr.port,
-            };
-
-            is_found_pktinfo = true;
-            break;
-        }
-    }
-
-    if (!is_found_pktinfo) {
-        return error.NoPktInfo;
-    }
-
-    return RecvMsgResult{
-        .pkt_info = pkt_info,
-        .bytes_received = bytes_recv,
-    };
 }
 
 test "CMSG macros" {
@@ -2372,8 +2357,8 @@ test "CMSG macros" {
     try testing.expectEqual(@as(usize, 16), unix.CMSG_ALIGN(9));
 
     // Test CMSG_LEN
-    const cmsg_size = @sizeOf(unix.cmsghdr);
-    const aligned_cmsg_size = unix.CMSG_ALIGN(cmsg_size);
+    const cmsghdr_size = @sizeOf(unix.cmsghdr);
+    const aligned_cmsg_size = unix.CMSG_ALIGN(cmsghdr_size);
     try testing.expectEqual(aligned_cmsg_size + 0, unix.CMSG_LEN(0));
     try testing.expectEqual(aligned_cmsg_size + 4, unix.CMSG_LEN(4));
 
@@ -2385,7 +2370,7 @@ test "CMSG macros" {
     var buffer: [256]u8 = undefined;
 
     // Create a message header
-    var msg: msghdr = undefined;
+    var msg: unix.msghdr = undefined;
     msg.control = &buffer;
     msg.controllen = buffer.len;
 
