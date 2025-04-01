@@ -2172,7 +2172,8 @@ const unix = struct {
             .base = buffer.ptr,
             .len = buffer.len,
         };
-
+        // we need to init `msghdr` explicitly, instead of leave it undefined
+        // otherwise Linux kernel doesn't like it
         var msg = msghdr{
             .name = @ptrCast(&src_addr),
             .namelen = @sizeOf(std.posix.sockaddr.storage),
