@@ -771,7 +771,7 @@ pub const Socket = struct {
         flags: u32,
         dest_addr: ?*const std.posix.sockaddr,
         addrlen: std.posix.socklen_t,
-    ) std.posix.SendToError!usize {
+    ) SendError!usize {
         if (!is_darwin) {
             return std.posix.sendto(sockfd, buf, flags, dest_addr, addrlen);
         }
@@ -792,7 +792,7 @@ pub const Socket = struct {
                 // connection-mode socket was connected already but a recipient was specified
                 // sendto using NULL destination address
                 .ISCONN => return std.posix.sendto(sockfd, buf, flags, null, 0),
-                .MSGSIZE => return error.MessageTooLong,
+                .MSGSIZE => return error.MessageTooBig,
                 .NOBUFS => return error.SystemResources,
                 .NOMEM => return error.SystemResources,
                 .NOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
